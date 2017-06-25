@@ -1,0 +1,221 @@
+#!/bin/sh
+#****************************************************************#
+# ScriptName: check_io_error.sh
+# Author: $jun.ruanj@alibaba-inc.com
+# Create Date: 2013-03-22 13:27
+# Modify Author: $SHTERM_REAL_USER@alibaba-inc.com
+# Modify Date: 2013-11-29 02:22
+# Function:
+#***************************************************************#
+export LANG=en_US.UTF-8
+export PATH="/sbin:/usr/sbin:/bin:/usr/bin:/usr/ali/bin:/usr/ali/sbin:/usr/local/bin:/usr/local/sbin"
+source /usr/alisys/dragoon/libexec/monitor/include/utils.sh
+
+#set -x
+function hardware_info
+{
+cpu_model=$(cat /proc/cpuinfo | grep "model name" | uniq | awk '{ print $7 }')
+dom0_cpu_num=$(cat /proc/cpuinfo | grep "model name" | wc -l)
+if [ -n "$(/sbin/lspci | grep -i sas2008)" ]; then
+    hba_model=sas2008
+    hba_driver=$(modinfo mpt2sas | grep ^version | awk '{ print $2 }')
+elif [ -n "$(/sbin/lspci | grep -i sas1068)" ]; then
+    hba_model=sas1068
+    hba_driver=$(modinfo mptsas | grep ^version | awk '{ print $2 }')
+elif [ -n "$(/sbin/lspci | grep -i sas2308)" ]; then
+    hba_model=sas2308
+    hba_driver=$(modinfo mpt2sas | grep ^version | awk '{ print $2 }')
+else
+    hba_model=unknow
+fi
+echo "hareware_info: cpu:$cpu_model, dom0:${dom0_cpu_num}core, hba_model:$hba_model, hba_driver:$hba_driver"
+}
+
+error=0
+
+function sysfsd_guestfsd_check
+{
+    coreproc_state='ok'
+    sysfsd_state=`ps -elf |grep sysfsd|grep -v grep|awk '{print $2}'`
+    if [ "$sysfsd_state" = 'D'  ];then coreproc_state='sysfsd' ; fi
+    guestfsd_pid=`cat /var/run/guestfsd.pid`
+    guestfsd_state=`ps -elf|grep guestfsd|grep $guestfsd_pid|awk '{print $2}'`
+    if [ "$guestfsd_state" = 'D' ];then 
+       if [ "$coreproc_state" = 'ok' ];then 
+          coreproc_state="guestfsd"
+       else
+          coreproc_state="$coreproc_state,guestfsd"
+       fi
+    fi
+}
+
+function process_check
+{
+
+D_disk="ok"
+proc_d=""
+process=$(ps -u root -U root u|grep -E 'jbd|flush-'|awk '{if($8 ~/[D]/) print $2 }')
+process_state=0
+
+if [ -n "$process" ]; then
+    for i in $process; do
+        check_state=0
+        for m in 1 2 3 4 5 6 7 8 9 10; do
+                sleep 1
+            stat=""
+                stat=`ps $i | awk '{if($3 ~/[D]/) print $3}'`
+                if [ -z $stat ];then
+                check_state=1
+                fi
+        done
+        if [ $check_state = "0" ]; then
+            process_state=1
+        fi
+    done
+fi
+
+for list in 1 2 3 4 5 ;do
+    d=$(ps auxf |grep -w D |grep "\[jbd" |awk -F/ '{print $2}' |cut -c -3)
+    sleep 1
+    proc_d="$proc_d"" ""$d"
+done
+d_disk_tmp=`echo $proc_d |tr ' ' '\n' | grep -v ^$ |sort |uniq -c |sort -r |head -n 1 |awk '{if($1 == "5") print $2}'`
+scsi_info=`lsscsi  |grep "/dev" |awk -F/ '{print $3}'`
+
+if [ $process_state -eq 1 ] && [ -n "`echo $scsi_info |grep $d_disk_tmp`" ]; then
+        #D_disk=$(ps -u root -U root u|grep -E 'jbd'|awk '{if($8 ~/[D]/) print $11 }'|awk -F "/" '{print $2}' |cut -c 1-3)
+        D_disk=$d_disk_tmp
+fi
+
+}
+
+
+function mpstat_check
+{
+
+if [ $error -eq 0 ]; then
+    return
+fi
+
+mpstat_status=`mpstat -P ALL 10 1 | grep -v CPU | grep -v all | grep Average | awk '{print $11}'`
+
+busy_state=0
+
+for i in $mpstat_status
+do
+        if [ $(echo "$i<=2.00"|bc) -eq 1 ]; then
+                busy_state=1
+        fi
+done
+
+if [ $busy_state = "1" ]; then
+        echo -e "Warning - some dom0 cores are very busy"
+        error=1
+fi
+
+}
+
+
+function iostat_check
+{
+util_busy_disk=""
+io_stat=`iostat -xm 10 2 | grep sd* | awk -v RS=avg-cpu 'NR==3 {print $0}' | grep sd. | awk '{print $1" "$14}'|awk '{if($2>90) print $1}'`
+
+
+if [ -n "$io_stat" ]; then
+        util_busy_disk="$io_stat"
+else
+        util_busy_disk="ok"
+fi
+
+}
+
+
+function error_log_check
+{
+hba_reset=0
+error_disk="ok"
+
+if [ $(date +"%-d") -lt 10 ]; then
+         error_num_sas=$(sudo tail -n 100000 /var/log/messages | grep -v blktap| grep -v sshd | grep "$(date -d last-hour +"%h  %-d %H")" | grep -E "mpt2sas0: sending diag reset" | wc -l)
+else
+         error_num_sas=$(sudo tail -n 100000 /var/log/messages | grep -v blktap| grep -v sshd | grep "$(date -d last-hour +"%h %-d %H")" | grep -E "mpt2sas0: sending diag reset" | wc -l)
+fi
+
+if [ $(date +"%-d") -lt 10 ]; then
+         error_num_medium=$(sudo tail -n 100000 /var/log/messages | grep -v blktap| grep -v sshd | grep "$(date -d last-hour +"%h  %-d %H")" | grep -E "Medium|media" | wc -l)
+else
+         error_num_medium=$(sudo tail -n 100000 /var/log/messages | grep -v blktap| grep -v sshd | grep "$(date -d last-hour +"%h %-d %H")" | grep -E "Medium|media" | wc -l)
+fi
+
+if [ $error_num_sas -ge 1 ]; then
+        #echo -e "Critical - $error_num_sas hba reset during the last hour"
+        hba_reset=1
+fi
+
+if [ $error_num_medium -gt 10 ]; then
+        error_disk=$(dmesg  |grep Medium |uniq |tail -n 1 |awk '{print $3}' |awk -F [ '{print $2}'|awk -F ] '{print $1}')
+
+fi
+
+}
+
+
+function smartctl_health_check
+{
+disklist=$(df |grep sd.|awk '{print $1}'|sed 's/[0-9]*//g'|sort -u)
+health_state=0
+unhealthy_disk="ok"
+for i in $disklist; do
+        smartctl_process=`ps aux |grep "smartctl -H $i"  |grep -v grep`
+        if [ -n "$smartctl_process" ];then
+                unhealthy_disk="$i"
+                continue
+        fi
+        state=""
+        state=$(sudo smartctl -H $i |grep result: |awk '{ print $6 }')
+        if [  "$state" = "FAILED!" ];then
+            health_state=1
+            unhealthy_disk="$i"
+        fi
+
+        smartctl_info=""
+        smartctl_info=$(sudo smartctl -a $i)
+        Reallocated_Sector_Ct=`echo "$smartctl_info" | grep Reallocated_Sector_Ct | awk '{print $10}'`
+        Current_Pending_Sector=`echo "$smartctl_info" | grep Current_Pending_Sector | awk '{print $10}'`
+        UDMA_CRC_Error_Count=`echo "$smartctl_info" | grep UDMA_CRC_Error_Count | awk '{print $10}'`
+        Offline_Uncorrectable=`echo "$smartctl_info" | grep Offline_Uncorrectable | awk '{print $10}'`
+        ERROR=`echo "$smartctl_info" | grep Error | wc -l`
+
+        if [ -n "$Reallocated_Sector_Ct" ] || [ -n "$Current_Pending_Sector" ] || [ -n "$UDMA_CRC_Error_Count" ] || [ -n "$Offline_Uncorrectable" ]; then
+        
+            if [ "$Offline_Uncorrectable" = '' ];then Offline_Uncorrectable=0 ; fi
+            if [ "$Current_Pending_Sector" = '' ];then Current_Pending_Sector=0 ; fi
+            if [ "$UDMA_CRC_Error_Count" = '' ];then UDMA_CRC_Error_Count=0 ; fi
+            if [ "$ERROR" = '' ];then ERROR=0 ; fi
+
+                if [ "$Current_Pending_Sector" -gt 5 ] || [ "$UDMA_CRC_Error_Count" -gt 100 ] || [ "$Offline_Uncorrectable" -gt 100 ] || [ "$ERROR" -gt 20  ]; then
+                health_state=1
+                unhealthy_disk="$i"
+                fi
+        fi
+
+done
+
+
+}
+
+error_log_check
+smartctl_health_check
+process_check
+sysfsd_guestfsd_check
+
+
+MSG="{\"D_disk\":\"$D_disk\",
+      \"D_core_process\":\"$coreproc_state\",
+      \"unhealthy_disk\":\"$unhealthy_disk\",
+      \"hba_reset\":$hba_reset,
+      \"error_disk\":\"$error_disk\",
+      \"error_num_medium\":$error_num_medium
+}"
+print_json

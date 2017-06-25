@@ -1,0 +1,3058 @@
+#!/bin/bash
+export PATH="/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin"
+export LANG="en_US.UTF-8"
+
+VER="v69"
+
+###zhilin.lkw@taobao.com
+###shijun.cao@alibaba-inc.com
+###jinli.zjl@alibaba-inc.com
+###hongmeng@taobao.com
+
+# COMMAND MACROS
+if grep -q "6\.[0-9]" /etc/redhat-release 2>/dev/null; then
+    CMD_YUM="/usr/bin/python2.6 /usr/bin/yum"
+elif grep -q "5\.[0-9]" /etc/redhat-release 2>/dev/null; then
+    CMD_YUM="/usr/bin/python2.4 /usr/bin/yum"
+elif grep -q "release 4" /etc/redhat-release 2>/dev/null; then
+    CMD_YUM="/usr/bin/python2.3 /usr/bin/yum"
+else
+    CMD_YUM="/usr/bin/yum"
+fi
+CMD_RPM="/bin/rpm"
+CMD_TAR="/bin/tar"
+CMD_LN="/bin/ln"
+CMD_TOUCH="/bin/touch"
+CMD_SED="/bin/sed"
+CMD_DMESG="/bin/dmesg"
+CMD_MKDIR="/bin/mkdir"
+CMD_MKNOD="/bin/mknod"
+CMD_UMOUNT="/bin/umount"
+CMD_BLOCKDEV="/sbin/blockdev"
+CMD_CHKCONFIG="/sbin/chkconfig"
+CMD_SERVICE="/sbin/service"
+CMD_IP="/sbin/ip"
+CMD_IFCONFIG="/sbin/ifconfig"
+CMD_LSPCI="/sbin/lspci"
+CMD_ETHTOOL="/sbin/ethtool"
+CMD_MDADM="/sbin/mdadm"
+CMD_MODPROBE="/sbin/modprobe"
+CMD_FILE="/usr/bin/file"
+CMD_IPMITOOL="/usr/bin/ipmitool"
+CMD_WGET="/usr/bin/wget -T10 -t3 -w3 -c -q -P /tmp"
+CMD_CURL="/usr/bin/curl -m 10 --connect-timeout 5 -4 -s"
+CMD_INSTALL="/usr/bin/install"
+CMD_TEE="/usr/bin/tee"
+CMD_DMIDECODE="/usr/sbin/dmidecode"
+CMD_XM="/usr/sbin/xm"
+CMD_SMARTCTL="/usr/sbin/smartctl"
+CMD_MEGACLI_OLD="/usr/local/sbin/MegaCli64"
+CMD_MEGARAID_SH="/usr/local/sbin/megaraid.sh"
+CMD_LSIUTIL="/usr/local/sbin/lsiutil"
+CMD_HPACUCLI="/usr/sbin/hpacucli"
+CMD_HPACUCLI8="/usr/local/sbin/hpacucli-8.60-8.0/hpacucli"
+test `uname -i` = "x86_64" && CMD_MEGACLI="/opt/MegaRAID/MegaCli/MegaCli64" || CMD_MEGACLI="/opt/MegaRAID/MegaCli/MegaCli"
+CMD_MEGARC="/usr/local/sbin/megarc.bin"
+CMD_CFGGEN="/usr/local/sbin/cfggen"
+CMD_SAS2IRCU="/usr/local/sbin/sas2ircu"
+CMD_ARCCONF="/usr/local/sbin/arcconf"
+CMD_ARCCONF_SUN="/usr/StorMan/arcconf"
+CMD_HWDIAG="/opt/huawei/bin/hwdiag"
+#by luxue
+CMD_HWINFO_HELP="/usr/alisys/dragoon/libexec/armory/hwinfo/helper.py"
+pub_psu_file="/usr/alisys/dragoon/libexec/monitor/hardware/PSU_NO_REPAIR_FILE"
+filesystem_readonly_flag="NO"
+filesystem_disk_error="NO"
+# status
+ok=0
+debug=1
+warning=1
+error=2
+critical=3
+unknown=4
+exitstatus=$ok
+diskstatus=$ok
+memstatus=$ok
+pwrstatus=$ok
+otherstatus=$ok
+flagstatus=$ok
+
+# message handling
+msg=""
+disk_msg=""
+mem_msg=""
+pwr_msg=""
+other_msg=""
+err_msg=""
+
+# common global vars
+suf="`id -u`"
+currtime=`date +%s`
+[ x"$IS_VENDOR" = "x1" ] && IS_HWQC=1
+([ -e /etc/ramos-release ] || hostname | grep -qE 'RAMOS|NGIS') && IS_RAMOS=YES || IS_RAMOS=NO
+pub_vendor=
+pub_alitype=
+pub_model=
+pub_sn=
+
+# common directories
+pub_chkhw_logdir="/var/log/check_hw"
+pub_lock_file="/dev/shm/check_log.pid"
+
+# For Armory query use
+pub_smartctl_group="^aliyun|^cnzz"
+
+# For logging
+pub_log_time=`date`
+pub_start_time=`date +'%Y-%m-%d %H:%M:%S'`
+
+# For disk check
+pub_sas2ircu_disp_txt="/dev/shm/sas2ircu_disp.txt.$suf"
+
+# For memory check
+pub_sel_mem_tmp="/dev/shm/sel_mem.tmp.$suf"
+pub_mce_threshold_reached="no"
+
+# For hwinfo integration
+pub_hwinfo="/etc/hwinfo/hwinfo.conf"
+pub_disk_raw=
+pub_disk_string=
+pub_mem_raw=
+pub_slot=
+pub_errorSlot=
+#by luxue
+pub_disk_sn=""
+pub_disk_manu=""
+pub_disk_size=""
+pub_disk_model=""
+pub_disk_type=""
+
+
+# format json output
+# FIXME: also write mptsas version as SAS1068E bug exists
+function pub_json_output() {
+    if ${CMD_LSPCI} 2>/dev/null | grep -qw SAS1068E; then
+        drv_ver=$(cat /sys/module/mptsas/version 2>/dev/null)
+        other_msg="${drv_ver}."
+        otherstatus=1
+    fi
+    if [ -z "$disk_msg" ]; then
+        diskstatus=0
+        disk_msg="Disk OK"
+    fi
+    if [ -z "$mem_msg" ]; then
+        memstatus=0
+        mem_msg="Memory OK"
+    fi
+    if [ -z "$pwr_msg" ]; then
+        pwrstatus=0
+        pwr_msg="Power OK"
+    fi
+    if [ -z "$other_msg" ]; then
+        otherstatus=0
+        other_msg="OK"
+    fi
+    [ -n "$err_msg" ] && flagstatus=$debug
+
+    cat<<EOF
+{
+    "collection_flag":$flagstatus,
+    "error_info":"${err_msg//\"/\"}",
+    "MSG":[
+        {"name":"general", "status":$exitstatus, "msg":"$msg"},
+        {"name":"harddisk", "status":$diskstatus, "msg":"${disk_msg//\"/\"}"},
+        {"name":"memory", "status":$memstatus, "msg":"$mem_msg"},
+        {"name":"power", "status":$pwrstatus, "msg":"$pwr_msg"},
+        {"name":"unknown", "status":$otherstatus, "msg":"$other_msg"}
+    ]
+}
+EOF
+}
+
+# write running log to /dev/shm/check_log.runtime and exit the script
+function pub_exit() {
+    pri_check_log=/dev/shm/check_log.runtime
+    if [[ `wc -l $pri_check_log 2>/dev/null |awk '{print $1}'` -gt "500" ]]; then
+        ${CMD_SUDO} ${CMD_SED} -i '1,5d' $pri_check_log &>/dev/null
+    fi
+    echo "$pub_start_time - `date +'%Y-%m-%d %H:%M:%S'` `basename $0` run complete as uid:`id -u` with ${VER}." | ${CMD_SUDO} ${CMD_TEE} -a $pri_check_log >/dev/null 2>&1
+    exit $exitstatus
+}
+
+# concat messages
+function pub_messageAppend() {
+    if [ $2 -eq 1 ]; then
+        if [ -z "$disk_msg" ]; then
+            disk_msg="$1"
+        else
+            disk_msg="$disk_msg $1"
+        fi
+    elif [ $2 -eq 2 ]; then
+        if [ -z "$mem_msg" ]; then
+            mem_msg="$1"
+        else
+            mem_msg="$mem_msg $1"
+        fi
+    elif [ $2 -eq 3 ]; then
+        if [ -z "$pwr_msg" ]; then
+            pwr_msg="$1"
+        else
+            pwr_msg="$pwr_msg $1"
+        fi
+    else
+        if [ -z "$other_msg" ]; then
+            other_msg="$1"
+        else
+            other_msg="$other_msg $1"
+        fi
+    fi
+    #pub_returnValue=2   #2代表什么呢？
+}
+
+# append message to /var/log/check_hw/check_log.log
+function pub_logfileAppend() {
+    [ -z "$1" ] && return
+    local pri_mes=$1
+    if [[ `wc -l ${pub_chkhw_logdir}/check_log.log 2>/dev/null |awk '{print $1}'` -gt "2000" ]]; then
+        sed -i '1,5d' ${pub_chkhw_logdir}/check_log.log &>/dev/null
+    fi
+    echo "$pub_log_time: $pri_mes" | ${CMD_SUDO} ${CMD_TEE} -a ${pub_chkhw_logdir}/check_log.log >/dev/null
+}
+
+# append message to /var/log/messages
+function pub_messageSend() {
+    [ x"$IS_RAMOS" = "xYES" ] && return
+    local pri_MSG_CHN=$1  # MSG_CHN 为报告的频道: debug,version,selfmon,raidpd,raidld,raidbbu,storage,filesystem,mem
+    local pri_MSG_TAG=$2  # MSG_TAG 为报告关键字，其值范围为：[ OK ] 、[ WARNING ] 、[ DEBUG ]
+    local pri_MSG_TXT=$3  # MSG_TXT 为报告的内容(这个消息可考虑追加给$pub_message)
+    ${CMD_SUDO} logger -p daemon.info -t HWBMC "checkhw.${pri_MSG_CHN} ${pri_MSG_TAG} ${pri_MSG_TXT}" &>/dev/null
+    #发旺旺要不要？
+}
+
+# Update message to /etc/motd
+function pub_motdEdit() {
+    [ $diskstatus -gt $exitstatus ] && exitstatus=$diskstatus
+    [ $memstatus -gt $exitstatus ] && exitstatus=$memstatus
+    [ $pwrstatus -gt $exitstatus ] && exitstatus=$pwrstatus
+    [ $otherstatus -gt $exitstatus ] && exitstatus=$otherstatus
+    if [[ -z "$disk_msg" && -z "$mem_msg" && -z "$pwr_msg" && -z "$other_msg" ]]; then
+        msg="OK - No error found."
+    elif [ $exitstatus -eq $critical ]; then
+        msg="Critical"
+    elif [ $exitstatus -eq $error ]; then
+        msg="Error"
+    elif [ $exitstatus -eq $warning ]; then
+        msg="Warning"
+    else
+        msg="Unknown"
+    fi
+    local pri_msg="${msg} - ${disk_msg} ${mem_msg} ${pwr_msg} ${other_msg}"
+    ${CMD_SUDO} ${CMD_SED} '/SYSLOG/d' -i /etc/motd &>/dev/null
+    #if echo "$pri_msg"|grep -qE "^Critical|^Error"; then
+    #    echo "SYSLOG Monitor Notice:["$pri_msg"], check it in http://idc.alibaba-inc.com/" | ${CMD_SUDO} ${CMD_TEE} -a /etc/motd >/dev/null 2>&1
+    #elif echo "$pri_msg"|grep -qE "^Warning"; then
+    #    echo "SYSLOG Monitor Notice:["$pri_msg"], not reported to IDCFree yet as it's not critical" | ${CMD_SUDO} ${CMD_TEE} -a /etc/motd >/dev/null 2>&1
+    #fi
+}
+
+# report to IDCFree
+function pub_IdcFreeCreate() {
+
+    [ x"$IS_VENDOR" = "x1" ] && return
+
+    local pri_error_disk=$1   #坏盘
+    local pri_error_log=$2   #错误日志
+    # 错误类型 1:硬盘故障,2:内存故障,3:电源故障,4:主板故障,5:其他,6:CPU故障,7:带外故障,8:SAS/RAID卡故障,9:raid卡电池故障,0:LogicDrive故障,a:mdstat故障
+    local pri_error_type=$3
+    local pri_raw_data=$4
+    local pri_raw=""
+    local pri_error_slot=""
+    local pri_api="repairapi"
+    select_group=$(pub_Armory_group)
+    select_idcfree_repair_state=$(pub_IDCfree_repair_state)
+
+    # select pri_api
+    #[ x"$IS_HWQC"   = "x1" ] && pri_api=hwqcAPI
+    #[ x"$IS_IDCNEW" = "x1" ] && pri_api=xinsunAPI
+
+    # don't report memory error if has huatuo
+    if pub_has_huatuo && [ x"$pri_error_type" = "x2" ]; then
+        echo "hardware_memory_error|$pri_error_disk" | ${CMD_SUDO} ${CMD_TEE} -a /dev/shm/huatuo.event >/dev/null 2>&1
+        return
+    fi
+	
+    #huatuo system, disk no repair
+    if pub_has_huatuo; then
+        if [ x"$pri_error_type" = "x1" ]; then
+	    return 
+        fi
+    fi
+    
+    #single psu environment, no repair psu error.
+    if [ x"$pri_error_type" = "x3" ]; then
+        if pub_has_only_one_psu; then
+	    return
+        fi
+    fi 
+    
+    #single psu server, no repair psu error.
+    if [ x"$pri_error_type" = "x3" ]; then
+        if pub_is_single_psu; then
+	    return 
+        fi
+    fi
+    
+    #ssd erase server, no repair harddisk error.
+    if echo $select_group | grep -q "ssd_erase"; then
+	return 
+    fi
+    
+    #if the idcfree repair state is REPAIR,no power repair 
+    if [ x"$pri_error_type" = "x3" ]; then    
+        if echo $select_idcfree_repair_state | grep -qwi "REPAIR"; then
+	    return
+        fi
+    fi
+
+    [ -n "$pri_raw_data" ] && pri_raw="&rawData=$pri_raw_data" || pri_raw=""
+    [ x"$pub_errorSlot" != "x" ] && pri_error_slot="&errorSlot=$pub_errorSlot" || pri_error_slot=""
+    if [ x"$IS_HWQC"   = "x1" ]; then
+        err_msg="Error - report to IDCFree failed: &type=$pri_error_type&errorDisk=$pri_error_disk&remark=$pri_error_log$pri_raw$pri_error_slot"
+    else
+        ${CMD_CURL} -d "userName=$pri_api&sn=$pub_sn&type=$pri_error_type&errorDisk=$pri_error_disk&remark=$pri_error_log$pri_raw$pri_error_slot" 'http://idc.alibaba-inc.com/repairapi!create.jspa' >/dev/null
+        if [ $? -ne 0 ]; then #如果失败就报修到公网API地址
+            ${CMD_CURL} -d "userName=$pri_api&sn=$pub_sn&type=$pri_error_type&errorDisk=$pri_error_disk&remark=$pri_error_log$pri_raw$pri_error_slot" 'http://42.156.166.86/repairapi!create.jspa' >/dev/null
+            if [ $? -ne 0 ]; then
+                ${CMD_CURL} -d "userName=$pri_api&sn=$pub_sn&type=$pri_error_type&errorDisk=$pri_error_disk&remark=$pri_error_log$pri_raw$pri_error_slot" 'http://100.67.16.32/repairapi!create.jspa' >/dev/null
+                if [ $? -ne 0 ]; then
+                    ${CMD_CURL} -d "userName=$pri_api&sn=$pub_sn&type=$pri_error_type&errorDisk=$pri_error_disk&remark=$pri_error_log$pri_raw$pri_error_slot" 'http://110.75.103.51/repairapi!create.jspa' >/dev/null
+                    if [ $? -eq 0 ]; then
+                        err_msg="Error - report to IDCFree failed: &type=$pri_error_type&errorDisk=$pri_error_disk&remark=$pri_error_log$pri_raw$pri_error_slot"
+                        pub_logfileAppend "$err_msg"
+                    fi
+                fi
+            fi
+        fi
+    fi
+}
+
+# Query idcfree records
+function pub_IdcFreeQuery() {
+
+    [ x"$IS_VENDOR" = "x1" ] && return 0
+
+    local pri_error_type=`echo "$1"|grep -E "^[0-9]+$"`
+    [ -z "$pri_error_type" ] && pri_error_type=1
+
+    local pri_idcfree_record
+    local pri_idcfree_count
+    pri_idcfree_record=`${CMD_CURL} -d "isCount=true&sn=$pub_sn&types=$pri_error_type&states=2,3,a,b,c,e,t,u,j,k,l" 'http://idc.alibaba-inc.com/repairapi!search.jspa' 2>/dev/null`
+    if [ -z $pri_idcfree_record ]; then
+        pri_idcfree_record=`${CMD_CURL} -d "isCount=true&sn=$pub_sn&types=$pri_error_type&states=2,3,a,b,c,e,t,u,j,k,l" 'http://42.156.166.86/repairapi!search.jspa' 2>/dev/null`
+        if [ -z $pri_idcfree_record ]; then
+            pri_idcfree_record=`${CMD_CURL} -d "isCount=true&sn=$pub_sn&types=$pri_error_type&states=2,3,a,b,c,e,t,u,j,k,l" 'http://100.67.16.32/repairapi!search.jspa' 2>/dev/null`
+            if [ -z $pri_idcfree_record ]; then
+                pri_idcfree_record=`${CMD_CURL} -d "isCount=true&sn=$pub_sn&types=$pri_error_type&states=2,3,a,b,c,e,t,u,j,k,l" 'http://110.75.103.51/repairapi!search.jspa' 2>/dev/null`
+            fi
+        fi
+    fi
+    pri_idcfree_count=`echo "$pri_idcfree_record" | grep -E "^[0-9]+$"`
+
+    return $pri_idcfree_count
+}
+
+# query repair state
+function pub_IDCfree_repair_state() {
+    local pri_idcfree_record
+    local pri_idcfree_repair_state
+
+    pri_idcfree_record=`${CMD_CURL} "http://api.a.alibaba-inc.com/page/api/free/opsfreeInterface/search.htm?q=sn==$pub_sn&_username=srmp" 2>/dev/null`
+    if [ $? -eq 0 ]; then
+        pri_idcfree_record=`${CMD_CURL} "http://a.am.alibaba-inc.com/page/api/free/opsfreeInterface/search.htm?q=sn==$pub_sn&_username=srmp" 2>/dev/null`
+        if [ $? -eq 0 ]; then
+            pri_idcfree_record=`${CMD_CURL} "http://a.alibaba-inc.com/page/api/free/opsfreeInterface/search.htm?q=sn==$pub_sn&_username=srmp" 2>/dev/null`
+        fi
+    fi
+ 
+    pri_idcfree_repair_state=`echo $pri_idcfree_record | awk -F"manager_state" '{print $2}'|awk -F"," '{print $1}'` 
+    if [ -n "$pri_idcfree_repair_state" ]; then
+        echo $pri_idcfree_repair_state
+    else
+        echo no_idcfree_repair_state
+    fi 
+}
+# get the alitype of the server
+function pub_Armory_alitype() {
+    local pri_alitype
+    local pri_alitype_record
+ 
+    pri_alitype_record=`${CMD_CURL} "http://api.a.alibaba-inc.com/page/api/free/opsfreeInterface/search.htm?q=sn==$pub_sn&select=sm_name&_username=srmp" 2>/dev/null`
+    if [ $? -ne 0 ]; then
+        pri_alitype_record=`${CMD_CURL} "http://a.am.alibaba-inc.com/page/api/free/opsfreeInterface/search.htm?q=sn==$pub_sn&select=sm_name&_username=srmp" 2>/dev/null`
+        if [ $? -ne 0 ]; then
+            pri_alitype_record=`${CMD_CURL} "http://a.alibaba-inc.com/page/api/free/opsfreeInterface/search.htm?q=sn==$pub_sn&select=sm_name&_username=srmp" 2>/dev/null`
+        fi
+    fi
+    pri_alitype=`echo $pri_alitype_record | awk -F"sm_name" '{print $2}' | awk -F"," '{print $1}'`
+    if [ -n "$pri_alitype" ]; then
+        echo $pri_alitype
+    else
+        echo no_alitype
+    fi
+
+}
+# query Armory groups
+function pub_Armory_group() {
+
+    [ x"$IS_VENDOR" = "x1" ] && echo "no_armory_result" && return
+
+    local pri_group
+    local pri_armory_record
+
+    pri_armory_record=`${CMD_CURL} "http://api.a.alibaba-inc.com/page/api/free/opsfreeInterface/search.htm?q=sn==$pub_sn&select=nodegroup&_username=srmp" 2>/dev/null`
+    if [ $? -ne 0 ]; then
+        pri_armory_record=`${CMD_CURL} "http://a.am.alibaba-inc.com/page/api/free/opsfreeInterface/search.htm?q=sn==$pub_sn&select=nodegroup&_username=srmp" 2>/dev/null`
+        if [ $? -ne 0 ]; then
+            pri_armory_record=`${CMD_CURL} "http://a.alibaba-inc.com/page/api/free/opsfreeInterface/search.htm?q=sn==$pub_sn&select=nodegroup&_username=srmp" 2>/dev/null`
+        fi
+    fi
+
+    pri_group=`echo $pri_armory_record | awk -F"nodegroup" '{print $2}'|awk -F\" '{print $3}'`
+
+    if [ -n "$pri_group" ]; then
+        echo $pri_group
+    else
+        echo no_armory_result
+    fi
+}
+
+# avoid duplicated running
+function pub_lock() {
+    if [ -e $pub_lock_file ] && ${CMD_SUDO} grep -qE "^[0-9]+$" $pub_lock_file; then
+        pri_proc_cmdline="`${CMD_SUDO} cat /proc/$(cat $pub_lock_file)/cmdline 2>/dev/null`"
+        if echo "$pri_proc_cmdline" | grep -q "`basename $0`"; then
+            [[ x"$IS_HWQC" = "x1" ]] && ignoreinfo="[Ignore_duplicated_run]" || ignoreinfo=""
+            exitstatus=$unknown
+            err_msg="$ignoreinfo Error - pid $(cat $pub_lock_file) is running! my pid is $$; conflict: $pri_proc_cmdline"
+            pub_json_output
+            exit $unknown
+        fi
+    fi
+    echo $$ | ${CMD_SUDO} ${CMD_TEE} $pub_lock_file >/dev/null 2>&1
+}
+
+function pub_vm_exit() {
+    msg="OK - VM box pass."
+    exitstatus=$ok
+    pub_json_output
+    pub_exit
+}
+
+# check if it's root
+# check if non-root accounts have sudo priv
+function pub_check_root() {
+    # root
+    if [ $suf -eq 0 ]; then
+        CMD_SUDO=""
+        return
+    fi
+    # not root, no sudo
+    if [ ! -x /usr/bin/sudo ]; then
+        exitstatus=$unknown
+        err_msg="Error - sudo package is not installed!"
+        pub_json_output
+        exit $unknown
+    fi
+
+    # not root, has sudo
+    CMD_SUDO="/usr/bin/sudo"
+    sudo true 2>/dev/null && return
+
+    # if no sudo priv, check if it's vm first
+    cat /etc/hwinfo/hwinfo.conf 2>/dev/null | grep -oE "system_hypervisor_type[^,]+," | grep -qE "xen-domU|container" && pub_vm_exit
+    cat /proc/self/cgroup 2>/dev/null | grep -qE "^[0-9]+:.+:/.+$" && pub_vm_exit
+    if [ -x ${CMD_FILE} ]; then
+        ${CMD_FILE} ${CMD_DMIDECODE} 2>/dev/null | grep -qE "ELF.*executable" || pub_vm_exit
+    fi
+
+    # if it's not VM
+    exitstatus=$unknown
+    err_msg="Error - sudo execution failed!"
+    pub_json_output
+    exit $unknown
+}
+
+# check if basic commands like lspci, smartctl and dmidecode exists.
+function pub_basetool() {
+    local pri_tool
+
+    for pri_tool in "${CMD_SMARTCTL}" "${CMD_LSPCI}" "${CMD_DMIDECODE}"; do
+        if [ ! -x ${pri_tool} ]; then
+            err_msg="Error - ${pri_tool} does not exist!"
+            pub_messageSend "debug" "[ DEBUG ]" "${pri_tool} does not exist!"
+            exitstatus=$unknown
+            pub_json_output
+            exit $unknown
+        fi
+    done
+
+    if [ x"$IS_RAMOS" = x"YES" ]; then
+        ${CMD_SUDO} ${CMD_YUM} -y install diffutils &>/dev/null
+    fi
+}
+
+# we don't check VM issues.
+# touch a file named /etc/HOSTISVM if VM
+function pub_isVirtualHost() {
+    # check hwinfo
+    hyper_type=`cat /etc/hwinfo/hwinfo.conf 2>/dev/null | grep -oE "system_hypervisor_type[^,]+,"`
+    echo "$hyper_type" | grep -qE "xen xen-dom0" && return
+    echo "$hyper_type" | grep -qE "xen-domU|container"     && pub_vm_exit
+
+    # 'control_d' if dom0, empty if domU
+    if [ -f /proc/xen/capabilities ]; then
+        ${CMD_SUDO} grep -iq 'control_d' /proc/xen/capabilities && return || pub_vm_exit
+    fi
+
+    # LXC container check
+    cat /proc/self/cgroup 2>/dev/null | grep -qE "^[0-9]+:.+:/.+$" && pub_vm_exit
+
+    # script or text file in some guest
+    if [ -x ${CMD_FILE} ]; then
+        ${CMD_FILE} ${CMD_DMIDECODE} 2>/dev/null | grep -qE "ELF.*executable" || pub_vm_exit
+    fi
+
+    # console=xvc0 if guest
+    grep -q 'console=xvc0' /proc/cmdline && pub_vm_exit
+
+    # dmidecode  check
+    pri_result=`${CMD_SUDO} ${CMD_DMIDECODE} 2>/dev/null`
+    echo "$pri_result" | grep "Vendor" | grep -qi 'xen' && pub_vm_exit
+    echo "$pri_result" | grep "Prod" | grep -qE "KVM|VMware|Bochs" && pub_vm_exit
+}
+
+function pub_firstrun() {
+    # Disable Dragoon Monitor
+    ${CMD_SUDO} ${CMD_TOUCH} /dev/shm/NOT_RUN_DRAGOON_CHECK_HARDWARE >/dev/null 2>&1
+
+    # disable eagleye
+    if [ -f /usr/local/eagleye/scripts/check_hardware.sh ]; then
+        if ${CMD_SUDO} ${CMD_SED} 's/#.*$//g' /usr/local/eagleye/scripts/check_hardware.sh 2>/dev/null | grep -wq "\Wcurl"; then
+            ${CMD_SUDO} ${CMD_SED} -i 's/\ curl/\ #curl/' /usr/local/eagleye/scripts/check_hardware.sh &>/dev/null
+        fi
+        if ${CMD_SUDO} ${CMD_SED} 's/#.*$//g' /usr/local/eagleye/scripts/check_hardware.sh 2>/dev/null | grep -wq "\Wpub_aliyun_umountDir"; then
+            ${CMD_SUDO} ${CMD_SED} -i 's/\ \ pub_aliyun_umountDir/\ \ #pub_aliyun_umountDir/' /usr/local/eagleye/scripts/check_hardware.sh &>/dev/null
+        fi
+    fi
+
+    export pub_vendor=$(echo $(${CMD_SUDO}  ${CMD_DMIDECODE} -s system-manufacturer  2>/dev/null | tail -1))
+    export pub_sn=$(echo $(${CMD_SUDO}      ${CMD_DMIDECODE} -s system-serial-number 2>/dev/null | tail -1))
+    export pub_alitype=$(pub_Armory_alitype)
+    #export pub_alitype=$(echo $(${CMD_SUDO} ${CMD_DMIDECODE} -s chassis-version      2>/dev/null | tail -1))
+    export pub_model=$(echo $(${CMD_SUDO}   ${CMD_DMIDECODE} -s system-product-name  2>/dev/null | tail -1))
+}
+
+function pub_check_download_server() {
+    # get reachable download_server ip
+    if hostname | grep -qE "\.cn[0-9]+|\.l2cn[0-9]+"; then
+        ips="yum.corp.taobao.com yum.tbsite.net 172.24.102.213 42.120.195.193"
+    else
+        ips="yum.tbsite.net 172.24.102.213 yum.corp.taobao.com 42.120.195.193"
+    fi
+    download_server=yum.tbsite.net
+    for ip in $ips; do
+        if ping -w 2 -q $ip >/dev/null 2>&1; then
+            download_server=$ip
+            break;
+        fi
+    done
+    #export pub_tools_server="http://${download_server}/aliyun/5Server/x86_64/server/hardware/tool"
+    export pub_server="http://${download_server}/aliyun/5Server/x86_64/server/hardware"
+}
+
+function pub_read_write() {
+    #exitstatus=$ok
+
+    #test -d ${pub_chkhw_logdir} || ${CMD_SUDO} ${CMD_MKDIR} -p ${pub_chkhw_logdir} 2>/dev/null
+    #st=`${CMD_SUDO} ${CMD_TOUCH} ${pub_chkhw_logdir}/check_harddisk 2>&1`
+    #if [ $? -ne 0 ]; then    #由于ROOT文件系统出问题了，因此直接报修。
+    #    if ! echo $st | grep -qi "No space"; then
+            #by luxue
+            #pub_IdcFreeCreate "/var" "/var or / partition touch failed" "1" #报修类型还是硬盘故障比较好
+    if [ x"$filesystem_readonly_flag" = "xYES" ] && [ x"$filesystem_disk_error" = "xNO" ]; then
+        pub_IdcFreeCreate "/" "Disk readonly. Please contact PE to reboot." "s" #报修类型更改为系统故障，维修说明是重启
+        pub_messageAppend "Disk readonly. Please contact PE to reboot." "s"
+        #fi
+        #disk_msg="Disk readonly. Please contact PE to reboot."    #
+        msg="Critical"
+        #exitstatus=$critical
+        #diskstatus=$critical
+        #pub_json_output
+        #pub_exit
+    fi
+}
+
+function pub_ipmitool_timeout() {
+    waitfor=10
+    ${CMD_SUDO} ${CMD_IPMITOOL} mc info >/dev/null 2>&1 &
+
+    while pgrep ipmitool -P $$ >/dev/null ; do
+        sleep 1
+        ((waitfor--))
+        if [ $waitfor -eq 0 ]; then
+            ${CMD_SUDO} killall -9 ipmitool -P $$ >/dev/null 2>&1 &
+            wait $!
+            return 127
+        fi
+    done
+    return 0
+}
+
+function pub_has_huatuo() {
+    if ${CMD_SUDO} [ -e /home/admin/badnode_monitor/huatuo_version ]; then
+        return 0
+    fi
+    if [ -e /dev/shm/DISK_NOT_RUN_CHECK_HARDWARE ]; then
+        return 0
+    fi
+    return 1
+}
+
+function pub_has_only_one_psu() {
+    cat $pub_psu_file | grep -q "$pub_sn"
+    if test $? -eq 0; then
+	return 0
+    else
+	return 1
+    fi
+}
+
+function pub_is_single_psu() {
+    select_armory_record=`${CMD_CURL} "http://api.a.alibaba-inc.com/page/api/free/opsfreeInterface/search.htm?q=sn==$pub_sn&select=idc,room&_username=srmp" 2>/dev/null`
+    if [ $? -ne 0 ]; then
+        select_armory_record=`${CMD_CURL} "http://a.am.alibaba-inc.com/page/api/free/opsfreeInterface/search.htm?q=sn==$pub_sn&select=idc,room&_username=srmp" 2>/dev/null`
+        if [ $? -ne 0 ]; then
+            select_armory_record=`${CMD_CURL} "http://a.alibaba-inc.com/page/api/free/opsfreeInterface/search.htm?q=sn==$pub_sn&select=idc,room&_username=srmp" 2>/dev/null`
+        fi
+    fi
+    
+    select_idc=`echo $select_armory_record | grep -oE "\{[^{]+idc[^}]+}" | awk -F"," '{print $1}' | awk -F"idc" '{print $NF}' | sed 's/\"\|://g'`
+    select_room=`echo $select_armory_record |grep -oE "\{[^{]+room[^}]+}" | awk -F"," '{print $2}' | awk -F"room" '{print $NF}' | sed 's/\"\|}\|://g'`
+
+    if echo $select_idc | grep -q "yh"; then
+	return 0
+    fi
+
+    if echo $select_room | grep -qE "2-1.CM6|2-2.CM6|2-3.CM6"; then
+	return 0
+    fi
+    
+    return 1
+}
+function pub_is_huawei_part() {
+    server_model=`echo $pub_model | tr [a-z] [A-Z]`
+    case "$server_model" in
+        "TECAL RH2285 V2-12L")
+	    return 0
+	    ;;
+        "TECAL RH2288H V2-12L")
+            return 0
+            ;;
+        "TECAL RH2285")
+            return 0
+            ;;
+	"RH2288HV2")
+            return 0
+            ;;
+	"TECAL RH1288 V2-8S")
+            return 0
+            ;;
+	"TECAL RH2288 V2-12L")
+            return 0
+            ;;
+	"TECAL XH321 V2")
+            return 0
+            ;;
+	"TECAL XH320 V2")
+            return 0
+            ;;
+	"TECAL RH2288 V2-12")
+            return 0
+            ;;
+	"RH2285V2")
+            return 0
+            ;;
+	"TECAL XH320")
+            return 0
+            ;;
+	"RH2288V2")
+	    return 0  
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+function pub_is_inv_part() {
+    server_model=`echo $pub_model | tr [a-z] [A-Z]`
+    case "$server_model" in
+        "K900-1G"|"K900-10G")
+            return 0
+            ;;
+        "K600-1G")
+            return 0
+            ;;
+        "K802-1G"|"K802-10G")
+            return 0
+            ;;
+        "K800-1G"|"K800-10G")
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+function pub_is_hp_part() {
+    server_model=`echo $pub_model | tr [a-z] [A-Z]`
+    case "$server_model" in
+	"PROLIANT DL360P GEN8"|"PROLIANT DL380P GEN8")
+	    return 0
+	    ;;
+	"PROLIANT DL380E GEN8")
+	    return 0
+	    ;;
+	"PROLIANT DL360 G7"|"PROLIANT DL380 G7")
+	    return 0
+            ;;
+	"PROLIANT SL210T Gen8")
+	    return 0
+            ;;
+	*)
+	    return 1
+	    ;;
+    esac
+}
+
+function pub_is_ecs_host() {
+    if [ x"`uname -r`" = "x2.6.32.36xen" ] || uname -r | grep -q "houyi"; then
+        return 0
+    fi
+    return 1
+}
+
+function pub_check_slot() {
+    local pri_diskname=$1
+    local pri_appendmsg=$2
+    #by luxue
+    local hwinfo_all_slots="/dev/shm/hwinfo_all_slots.log"
+    local hwinfo_slot=""
+    local hwinfo_sn=""
+
+    pub_disk_raw=""
+    pub_slot=""
+    pub_disk_string=""
+    #by luxue
+    pub_disk_sn=""
+    if [[ -e $pub_hwinfo ]]; then
+        if grep -q "MegaRAID" $pub_hwinfo; then
+            :
+        elif grep -q "Smart Array" $pub_hwinfo; then
+            :
+        elif grep -qE "SAS1" $pub_hwinfo; then
+            pri_ctrl_nr=`${CMD_SUDO} ${CMD_LSPCI} | grep "SAS1" | wc -l`
+            if [ $pri_ctrl_nr -eq 1 ]; then
+                pub_sas_disk_report $pri_diskname
+            fi
+        elif grep -qE "SAS2" $pub_hwinfo; then
+            pub_sas_disk_report $pri_diskname
+        elif echo "$pub_alitype" | grep -qE "S9-13H|S10-13H"; then
+            pub_13h_disk_report $pri_diskname
+        fi
+    fi
+    
+    #by luxue
+    if [[ -z "$pub_slot" ]]; then
+        ${CMD_HWINFO_HELP} disk> $hwinfo_all_slots
+        if [[ $? -eq 0 ]]; then
+            gethwinfo_inuse=`cat $hwinfo_all_slots | grep "$pri_diskname" | grep "inuse" | head -1`
+            gethwinfo_unknown=`cat $hwinfo_all_slots | grep "$pri_diskname" | grep "unknown" | tail -1`
+            if [[ -n $gethwinfo_inuse ]]; then
+                hwinfo_slot=`echo $gethwinfo_inuse | grep "$pri_diskname" | awk -F, '{print $3}'`
+                pub_disk_sn=`echo $gethwinfo_inuse | grep "$pri_diskname" | awk -F, '{print $4}'`
+                pub_disk_model=`echo $gethwinfo_inuse | grep "$pri_diskname" | awk -F, '{print $6}'`
+                pub_disk_size=`echo $gethwinfo_inuse | grep "$pri_diskname" | awk -F, '{print $7}'`
+                pub_disk_type=`echo $gethwinfo_inuse | grep "$pri_diskname" | awk -F, '{print $8}'`
+                pub_disk_manu=`echo $gethwinfo_inuse | grep "$pri_diskname" | awk -F, '{print $9}'`
+            elif [[ -n $gethwinfo_unknown ]]; then
+                hwinfo_slot=`echo $gethwinfo_unknown | grep "$pri_diskname" | awk -F, '{print $3}'`
+                pub_disk_sn=`echo $gethwinfo_unknown | grep "$pri_diskname" | awk -F, '{print $4}'`
+                pub_disk_model=`echo $gethwinfo_unknown | grep "$pri_diskname" | awk -F, '{print $6}'`
+                pub_disk_size=`echo $gethwinfo_unknown | grep "$pri_diskname" | awk -F, '{print $7}'`
+                pub_disk_type=`echo $gethwinfo_unknown | grep "$pri_diskname" | awk -F, '{print $8}'`
+                pub_disk_manu=`echo $gethwinfo_unknown | grep "$pri_diskname" | awk -F, '{print $9}'`
+            fi
+            if [[ -n "$hwinfo_slot" ]]; then
+                pri_ctrl=`echo $hwinfo_slot | awk -F: '{ print $1 }'`
+                pri_encl=`echo $hwinfo_slot | awk -F: '{ print $2 }'`
+                pri_slot=`echo $hwinfo_slot | awk -F: '{ print $3 }'`
+                #echo $pub_model | grep -q "DL380e Gen8" && slot_inc=0 || slot_inc=1
+                vendor=`echo $pub_vendor | tr [a-z] [A-Z]`
+                echo $vendor | grep -q "HP" && slot_inc=0 || slot_inc=1
+                case $((pri_slot + slot_inc)) in 
+                    1)
+		        pub_slot="Slot $pri_slot, $((pri_slot + slot_inc))st disk"
+		        ;;
+                    2)
+		        pub_slot="Slot $pri_slot, $((pri_slot + slot_inc))nd disk"
+		        ;;
+                    3)
+		        pub_slot="Slot $pri_slot, $((pri_slot + slot_inc))rd disk"
+		        ;;
+                    *)
+		        pub_slot="Slot $pri_slot, $((pri_slot + slot_inc))th disk"
+		        ;;
+                esac
+            fi
+        fi
+    fi
+    rm -f $hwinfo_all_slots
+
+    # pub_disk_string Example
+    # 1. Slot:
+    # Slot=Y: /dev/sdl (Slot 11, 第12块盘) | Log: kernel: : end_request: I/O error, dev sdl, sector 2305532759
+    # 2. No Slot:
+    # Slot=N: /dev/sdl (请服务台确认Slot) | Log: kernel: : end_request: I/O error, dev sdl, sector 2305532759
+    if [[ -n "$pub_slot" ]]; then
+        pub_disk_string="Slot=Y: $pri_diskname ($pub_slot) $pri_appendmsg"
+    else
+        #pri_model=$(cat "/sys/block/${pri_disk/\//\!}/device/model" 2>/dev/null | sed 's/[ ]*$//g')
+        #grep -qE "^DGC$|^EMC$" "/sys/block/${pri_disk/\//\!}/device/vendor" 2>/dev/null && return 1
+        if [[ -n "$pub_disk_sn" ]]; then
+            pub_disk_string="Slot=N: $pri_diskname (SN: $pub_disk_sn) $pri_appendmsg"
+        else
+            pub_disk_string="Slot=N: $pri_diskname (IOP-SA please confirm Slot) $pri_appendmsg"
+        fi
+    fi
+}
+
+function pub_13h_disk_report() {
+    local pri_diskname=$1
+    local pri_diskinfos=""
+    local pri_diskinfo
+    local pri_diskinfo_inuse=""
+    local pri_diskinfo_unknown=""
+    local pri_get_rawdata=1
+
+    pub_slot=""
+    pri_diskinfos=`grep -oE "\{[^{]+$pri_diskname[^}]+}" $pub_hwinfo`
+    pri_diskinfo_inuse=`echo "$pri_diskinfos" | grep "inuse" | head -1`
+    pri_diskinfo_unknown=`echo "$pri_diskinfos" | grep "unknown" | tail -1`
+    if [[ -n "$pri_diskinfo_inuse" ]]; then # disk is available
+        pub_disk_raw=$pri_diskinfo_inuse
+        pri_sn=`echo "${pub_disk_raw//[\" ]/}" | grep -oE 'serial_number:[^,]+'`
+        pub_disk_manu=`echo "${pub_disk_raw//[\" ]/}" | grep -oE 'manufacturer:[^,]+' | awk -F":" '{print $2}' | sed 's/}//g'`
+        pub_disk_model=`echo "${pub_disk_raw//[\" ]/}" | grep -oE 'model:[^,]+' | awk -F":" '{print $2}' | sed 's/}//g'`
+        pub_disk_size=`echo "${pub_disk_raw//[\" ]/}" | grep -oE 'size:[^,]+' | awk -F":" '{print $2}' | sed 's/}//g'`
+        pub_disk_type=`echo "${pub_disk_raw//[\" ]/}" | grep -oE 'type:[^,]+' | awk -F":" '{print $2}' | sed 's/}//g'`
+        if [[ -z "$pri_sn" ]] && [[ -n "$pri_diskinfo_unknown" ]]; then
+            pub_disk_raw=$pri_diskinfo_unknown
+            pri_sn=`echo "${pub_disk_raw//[\" ]/}" | grep -oE 'serial_number:[^,]+'`
+            pub_disk_manu=`echo "${pub_disk_raw//[\" ]/}" | grep -oE 'manufacturer:[^,]+' | awk -F":" '{print $2}' | sed 's/}//g'`
+        fi
+        if [[ -z "$pri_sn" ]]; then
+            pub_disk_raw=""
+            pri_get_rawdata=0
+        fi
+    elif [[ -n "$pri_diskinfo_unknown" ]]; then # disk was available
+        pub_disk_raw=$pri_diskinfo_unknown
+        pri_sn=`echo "${pub_disk_raw//[\" ]/}" | grep -oE 'serial_number:[^,]+' | awk -F":" '{print $2}'`
+        pub_disk_manu=`echo "${pub_disk_raw//[\" ]/}" | grep -oE 'manufacturer:[^,]+' | awk -F":" '{print $2}' | sed 's/}//g'`
+        pub_disk_model=`echo "${pub_disk_raw//[\" ]/}" | grep -oE 'model:[^,]+' | awk -F":" '{print $2}' | sed 's/}//g'`
+        pub_disk_size=`echo "${pub_disk_raw//[\" ]/}" | grep -oE 'size:[^,]+' | awk -F":" '{print $2}' | sed 's/}//g'`
+        pub_disk_type=`echo "${pub_disk_raw//[\" ]/}" | grep -oE 'type:[^,]+' | awk -F":" '{print $2}' | sed 's/}//g'`
+        if [[ -z "$pri_sn" ]]; then
+            pub_disk_raw=""
+            pri_get_rawdata=0
+        fi
+    fi
+    
+    pub_disk_sn=$pri_sn
+    hostid=`lsscsi 2>/dev/null | grep $pri_diskname | awk '{ print $1 }' | awk -F\[ '{ print $2 }' | awk -F: '{ print $1 }'`
+    if [[ -n "$hostid" ]]; then
+        if [ "$hostid" -le 5 ]; then
+            pub_slot="AHCI $hostid Slot $hostid"
+            return
+        elif [ "$hostid" -eq 6 ]; then
+            pub_slot="SCU-0"
+        elif [ "$hostid" -eq 7 ]; then
+            pub_slot="SCU-1"
+        fi
+    fi
+    [ -z "$pub_slot" ] && return
+
+    if [ $pri_get_rawdata -eq 1 ]; then
+        pub_slot="$pub_slot Bad $pri_sn"
+        return
+    fi
+
+    # if RawData doesn't exist.
+    scu_disks=`lsscsi $hostid: | awk '{ print $NF }'`
+    pri_sn=""
+    for disk in $scu_disks; do
+        echo $disk | grep -q "$pri_diskname" && continue
+        pri_diskinfos=`grep -oE "\{[^{]+$disk[^}]+}" $pub_hwinfo | head -1`
+        sn=`echo ${pri_diskinfos//[\" ]/} | grep -oE 'serial_number:[^,]+' | awk -F: '{ print $2 }'`
+        pri_sn="$pri_sn $sn"
+    done
+    pub_slot="$pub_slot Good serial_numbers: $pri_sn"
+}
+
+function pub_sas_disk_report() {
+    local pri_diskname=$1
+    local pri_diskinfos=""
+    local pri_diskinfo
+    local pri_diskinfo_inuse=""
+    local pri_diskinfo_unknown=""
+    local pri_slotinfo=""
+    local pri_ctrl
+    local pri_encl
+    local pri_slot
+
+    # pri_disk_info example:
+    # {"slot": "0:2:10", "diskname": "/dev/sdf", "firmware_revision": "ES64", ->
+    #  "serial_number": "6SJ3NMQV", "model": "ST3300657SS", "physical_status": "inuse", ->
+    #  "type": "HDD_SAS", "manufacturer": "Seagate", "size": "300"}
+    pri_diskinfos=`grep -oE "\{[^{]+$pri_diskname[^}]+}" $pub_hwinfo`
+    pri_diskinfo_inuse=`echo "$pri_diskinfos" | grep "inuse" | head -1`
+    pri_diskinfo_unknown=`echo "$pri_diskinfos" | grep "unknown" | tail -1`
+    if [[ -n "$pri_diskinfo_inuse" ]]; then # disk is available
+        pub_disk_raw=$pri_diskinfo_inuse
+    elif [[ -n "$pri_diskinfo_unknown" ]]; then # disk was available
+        pub_disk_raw=$pri_diskinfo_unknown
+    else
+        return
+    fi
+
+    # slot example: 0:2:10
+    pri_slotinfo=`echo "${pub_disk_raw//[\" ]/}" | grep -oE 'slot:[^,]+'`
+    pub_disk_sn=`echo "${pub_disk_raw//[\" ]/}" | grep -oE 'serial_number:[^,]+' | awk -F":" '{print $2}'`
+    pub_disk_manu=`echo "${pub_disk_raw//[\" ]/}" | grep -oE 'manufacturer:[^,]+' | awk -F":" '{print $2}' | sed 's/}//g'`
+    pub_disk_model=`echo "${pub_disk_raw//[\" ]/}" | grep -oE 'model:[^,]+' | awk -F":" '{print $2}' | sed 's/}//g'`
+    pub_disk_size=`echo "${pub_disk_raw//[\" ]/}" | grep -oE 'size:[^,]+' | awk -F":" '{print $2}' | sed 's/}//g'`
+    pub_disk_type=`echo "${pub_disk_raw//[\" ]/}" | grep -oE 'type:[^,]+' | awk -F":" '{print $2}' | sed 's/}//g'`
+    [[ -z "$pri_slotinfo" ]] && return
+    pri_ctrl=`echo $pri_slotinfo | awk -F: '{ print $2 }'`
+    pri_encl=`echo $pri_slotinfo | awk -F: '{ print $3 }'`
+    pri_slot=`echo $pri_slotinfo | awk -F: '{ print $4 }'`
+    [[ -z "$pri_slot" ]] && return
+
+    #echo $pub_model | grep -q "DL380e Gen8" && slot_inc=0 || slot_inc=1
+    vendor=`echo $pub_vendor | tr [a-z] [A-Z]`
+    echo $vendor | grep -q "HP" && slot_inc=0 || slot_inc=1 
+    case $((pri_slot + slot_inc)) in
+        1)
+            pub_slot="Slot $pri_slot, $((pri_slot + slot_inc))st disk"
+            ;;
+        2)
+            pub_slot="Slot $pri_slot, $((pri_slot + slot_inc))nd disk"
+            ;;
+        3)
+            pub_slot="Slot $pri_slot, $((pri_slot + slot_inc))rd disk"
+            ;;
+        *)
+            pub_slot="Slot $pri_slot, $((pri_slot + slot_inc))th disk"
+            ;;
+    esac
+}
+
+# Kelude BZ: http://k3.alibaba-inc.com/issue/5098312
+function pub_mcelog_Dell_OB() {
+    echo "$pub_vendor" | grep -qi "Dell" || return 1
+    echo "$HOSTNAME" | grep -qi "OceanBase" || return 1
+    tail /var/log/mcelog | grep ^Transaction | tail -1 | grep -q 'Generic undefined request' || return 1
+    return 0
+}
+
+function pub_check_mcelog_inspur() {
+    if [ `cat "$pub_sel_mem_tmp" 2>/dev/null | wc -l` -eq 0 ]; then
+        return
+    fi
+
+    local pri_sel_bin="/dev/shm/sel_bin.tmp.$suf"
+    local pri_sel_hex="/dev/shm/sel_hex.tmp.$suf"
+    local pri_dimm_info="/dev/shm/dimm_info.txt.$suf"
+
+    ${CMD_SUDO} ${CMD_IPMITOOL} sel writeraw "$pri_sel_bin" >/dev/null
+    hexdump "$pri_sel_bin" | grep "c4" > "$pri_sel_hex"
+    
+    rm -f "$pri_dimm_info"; ${CMD_TOUCH} "$pri_dimm_info"
+    while read line; do
+# BUG: SA5248L has incorrect DIMM info
+#        if [ x"$pub_model" = "xSA5248L" ]; then
+#            errordisk="`echo $(echo ${line} | awk -F\| '{ print $NF }')`"
+#            errormsg="$line"
+        # INSPUR自研机型，通过位运算定位
+        # SA5212H2 - S9
+        # SN6115M4-1G-SF, SN6115M4-10G-SF - S9-13H, S10-13H-6T
+        # SN5115M3, SN5115M2 - S9-8H
+        # NF5270M3 - S10-4T
+        if [ x"$pub_model" = "xSA5212H2" ] ||\
+             [ x"$pub_model" = "xSN6115M4-1G-SF" ] || [ x"$pub_model" = "xSN6115M4-10G-SF" ] ||\
+             [ x"$pub_model" = "xSN5115M3" ] || [ x"$pub_model" = "xSN5115M2" ] ||\
+             [ x"$pub_model" = "xNF5270M3" ]; then
+            pri_seq=`printf "%06x0" $(echo $line | awk -F\| '{ print "0x" $1 }')`
+            pri_bit=0x`cat "$pri_sel_hex" | grep -w "$pri_seq" | head -1 | awk '{ print $8 $9 }'` #0xa870ff00
+            [[ "$pri_bit" != "0x" ]] || continue
+            cpu=$((pri_bit & 0xff))
+            chn=$(((pri_bit >> 24 & 0x0c) >> 2))
+            dim=$((pri_bit >> 24 & 0x03))
+
+            errordisk="CPU $cpu CHN $chn DIMM $dim"
+            pub_errorSlot="$errordisk"
+            errormsg="$line | happens at $errordisk"
+        elif [ x"$pub_model" = "xSA5212M4" ]; then
+            dim=`echo $line | awk -F"|" '{print $4}'`
+            if ! echo $dim | grep -qi 'MEM_CH'; then
+                dim=`echo $line | awk -F"|" '{print $3}'`
+            fi
+            if echo $dim | grep -qi 'MEM_CH'; then
+                errordisk="$dim"
+            else
+                errordisk="Mem ECC Error"
+            fi
+            pub_errorSlot="$errordisk"
+            errormsg="$line"
+        elif [ x"$pub_model" = "xSN6116M4-1G-SH" ] || [ x"$pub_model" = "xSN6116M4-10G-SH" ] || [ x"$pub_model" = "xSN3116M4-10G-SH" ];then
+            pri_record=`echo $line| awk -F"|" '{print $1}'| sed 's/ //g'`
+            pri_record_len=`echo -n $pri_record | wc -c`
+            case $pri_record_len in
+                1)
+                    sensor_low="0x"$pri_record"" && sensor_hign="0x"00""
+                    ;;
+                2)
+                    sensor_low="0x"$pri_record"" && sensor_hign="0x"00""
+                    ;;
+                3)
+                    sensor_hign="0x"${pri_record:0:1}"" && sensor_low="0x"${dell_memrecord:1:4}""
+                    ;;
+                4)
+                    sensor_hign="0x"${pri_record:0:2}"" && sensor_low="0x"${dell_memrecord:2:4}""
+                    ;;
+                *)
+                    ;;
+            esac
+            if [ -n "$sensor_low" -a -n "$sensor_hign" ]; then
+                sensor=`${CMD_SUDO} ${CMD_IPMITOOL} raw 0x0a 0x43 0x00 0x00 "$sensor_low" "$sensor_hign" 0x00 0xff | tail -1 | tr [a-z] [A-Z] | sed -e 's/^\s\+//;s/\s\+$//'`
+                data2=`echo $sensor | awk -F" " '{print $1}' | sed 's/ //g'`
+                data3=`echo $sensor | awk -F" " '{print $2}' | sed 's/ //g'`
+            fi
+            if [ x"$pub_model" = "xSN6116M4-1G-SH" ] || [ x"$pub_model" = "xSN6116M4-10G-SH" ]; then
+                cpu=$(((0x$data2 & 0xc0) >> 6))
+                chn=$(((0x$data2 & 0x38) >> 3))
+                dim=$((0x$data2 & 0x07))
+            elif [ x"$pub_model" = "xSN3116M4-10G-SH" ];then
+                cpu=$(((0x$data3 & 0xc0) >> 6))
+                chn=$(((0x$data3 & 0x30) >> 4))
+                dim=$((0x$data3 & 0x0f))
+            fi
+            errordisk="CPU $cpu CHN $chn DIMM $dim"
+            pub_errorSlot="$errordisk"
+            errormsg="$line"
+        else
+            errordisk="Mem ECC Error"
+            errormsg="$line"
+        fi
+
+        if echo "$line" | grep -q "Uncorrectable"; then
+            memstatus_print="CRITICAL"
+            uce="UCE "
+        else
+            [[ x"$pub_mce_threshold_reached" = "xyes" ]] && memstatus_print="ERROR" || memstatus_print="WARNING"
+            uce=""
+        fi
+        pub_messageSend "mem" "[ $memstatus_print ]" "$errormsg"
+        if ! grep -q "$errordisk" "$pri_dimm_info"; then # 防止重复Append，造成刷屏
+            echo "$errordisk" >> "$pri_dimm_info"
+            pub_messageAppend "$errormsg" 2
+            if [ x"$pub_mce_threshold_reached" = "xyes" ]; then
+                #pub_IdcFreeCreate "${uce}${errordisk}" "$errormsg" "2"
+                pub_IdcFreeCreate "${errordisk}" "$errormsg" "2"
+            fi
+        fi
+        pub_errorSlot=""
+    done < $pub_sel_mem_tmp
+
+    if grep -q "Uncorrectable" "$pub_sel_mem_tmp"; then
+        memstatus=$critical
+    elif [ x"$pub_mce_threshold_reached" = "xyes" ]; then
+        memstatus=$error
+    else
+        memstatus=$warning
+    fi
+    rm -f "$pri_dimm_info" "$pri_sel_hex"
+    echo "" | ${CMD_SUDO} ${CMD_TEE} "${pri_sel_bin}" >/dev/null # sel.bin is created by root
+}
+
+function pub_check_mcelog_inventec() {
+    local pri_sel_lines=$(cat "$pub_sel_mem_tmp" 2>/dev/null | wc -l)
+    if [ "$pri_sel_lines" -eq 0 ]; then
+        return
+    fi
+
+    local pri_sel_save="/dev/shm/sel_save.tmp.$suf"
+    local pri_sel_save_mem="/dev/shm/sel_save_mem.tmp.$suf"
+    local pri_dimm_info="/dev/shm/dimm_info.txt.$suf"
+
+    ${CMD_SUDO} ${CMD_IPMITOOL} sel save "$pri_sel_save" >/dev/null 2>&1
+    cat "$pri_sel_save" | grep "Memory" | grep -E "Correctable|Uncorrectable" | tail -n "$pri_sel_lines" | sort | uniq > "$pri_sel_save_mem"
+    if [ -z "$(cat $pri_sel_save_mem 2>/dev/null)" ]; then
+        rm -f $pri_sel_save_mem &>/dev/null
+        return
+    fi
+
+    rm -f "$pri_dimm_info"; ${CMD_TOUCH} "$pri_dimm_info"
+    while read line; do
+        case "$pub_model" in
+            *A40*)
+                ed3=`echo $line | awk '{ print $7 }'`
+                dim=$((ed3 & 0x1))
+                #ch=$(((ed3 >> 1) % 3))
+                #cpu=$(((ed3 >> 1) / 3))
+                #cpu_ch_dim="CPU${cpu}/Ch${ch}/DIM${dim}"
+                dimm_slot=$(echo $((ed3 >> 1)) | awk '{ printf("%c", $1+65) }')$dim
+                errordisk="DIMM_$dimm_slot"
+                nd="DIMM$dimm_slot"
+                ;;
+            *K600*|*B700*|*A700*)
+                ed3=`echo $line | awk '{ print $7 }'`
+                case "$ed3" in
+                    0x10) errordisk="DIMM A0"; nd="Node0_Dimm0" ;;
+                    0x11) errordisk="DIMM A1"; nd="Node0_Dimm1" ;;
+                    0x20) errordisk="DIMM B0"; nd="Node0_Dimm2" ;;
+                    0x21) errordisk="DIMM B1"; nd="Node0_Dimm3" ;;
+                    0x30) errordisk="DIMM C0"; nd="Node0_Dimm4" ;;
+                    0x31) errordisk="DIMM C1"; nd="Node0_Dimm5" ;;
+                    0x50) errordisk="DIMM D0"; nd="Node1_Dimm0" ;;
+                    0x51) errordisk="DIMM D1"; nd="Node1_Dimm1" ;;
+                    0x60) errordisk="DIMM E0"; nd="Node1_Dimm2" ;;
+                    0x61) errordisk="DIMM E1"; nd="Node1_Dimm3" ;;
+                    0x70) errordisk="DIMM F0"; nd="Node1_Dimm4" ;;
+                    0x71) errordisk="DIMM F1"; nd="Node1_Dimm5" ;;
+                    *)    errordisk="Mem ECC Error"; nd="Node_null" ;;
+                esac
+                ;;
+            #*K800*|*K900*|*A900*)
+            *A900-*|*K900-*)
+                ed2=`echo $line | awk '{print $6}'`
+                bios_version_file="/dev/shm/bios_version_file"
+                if [ ! -e $bios_version_file ]; then
+                    sudo dmidecode -s bios-version > $bios_version_file
+                fi
+                bios_version=`cat $bios_version_file | tr [a-z] [A-Z]`
+                if [[ "$bios_version" < "A2.32" ]]; then
+                    ed3=`echo $line | awk '{ print $7 }' | tr [a-z] [A-Z]`
+                    cpu=$((ed2))
+                    dimm=${ed3/0X/}
+                    errordisk="CPU${cpu} DIMM${dimm}"
+                    nd="CPU${cpu}_Dimm${dimm}" 
+                else
+                    pub_mce_threshold_reached="yes"
+                    cpu=$(($((ed2 & 0x40)) >> 6))
+                    dim=$((ed2 & 0x07))
+                    cha=$(($((ed2 & 0x38)) >> 3))
+                    errordisk="CPU${cpu} CHA${cha} DIMM${dim}"
+                    nd="CPU${cpu}_CHA${cha}_DIMM${dim}"
+                fi
+                ;;
+            *K800-*|*K802-*)
+                ed2=`echo $line | awk '{ print $6 }'`
+                #ed3=`echo $line | awk '{ print $7 }'`
+                ed3=`echo $line | awk '{ print $7 }' | tr [a-z] [A-Z]`
+                cpu=$((ed2))
+                dimm=${ed3/0X/}
+                errordisk="CPU${cpu} DIMM${dimm}"
+                nd="CPU${cpu}_Dimm${dimm}"
+                ;;
+            *K800G3-10G*|*K900G3-10G*|*A900G3-10G*)
+                ed2=`echo $line | awk '{ print $6 }'`
+                cpu=$(($((ed2 & 0x40)) >> 6))
+                dim=$((ed2 & 0x07))
+                cha=$(($((ed2 & 0x38)) >> 3))
+                errordisk="CPU${cpu} CHA${cha} DIMM${dim}"
+                nd="CPU${cpu}_CHA${cha}_DIMM${dim}"
+                ;;
+            *A220-10G-CH*)
+                ed3=`echo $line | awk '{ print $7 }'| tr [a-z] [A-Z]`
+                [ "$ed3" == "0X00" ] && nd="CPU0_CHA0_DIM0" && errordisk="CPU0 CHA0 DIM0"
+                [ "$ed3" == "0X01" ] && nd="CPU0_CHA0_DIM1" && errordisk="CPU0 CHA0 DIM1"
+                [ "$ed3" == "0X10" ] && nd="CPU0_CHA1_DIM0" && errordisk="CPU0 CHA1 DIM0"
+                [ "$ed3" == "0X11" ] && nd="CPU0_CHA1_DIM1" && errordisk="CPU0 CHA1 DIM1"
+                ;;
+            *)
+                errordisk="Mem ECC Error"
+                nd="Node_null"
+                ;;
+        esac
+        if [ x"$nd" != "xNode_null" ]; then
+            errormsg="`echo $line; ${CMD_SUDO} ${CMD_DMIDECODE} -t memory 2>/dev/null| grep -C 10 -i \"Locator.*$nd\"`"
+        else
+            errormsg="$line"
+        fi
+
+        if echo "$line" | grep -q "Uncorrectable"; then
+            memstatus_print="CRITICAL"
+            uce="UCE "
+        else
+            [[ x"$pub_mce_threshold_reached" = "xyes" ]] && memstatus_print="ERROR" || memstatus_print="WARNING"
+            uce=""
+        fi
+        pub_messageSend "mem" "[ $memstatus_print ]" "$line"
+        if ! grep -q "$errordisk" "$pri_dimm_info"; then # 防止重复Append，造成刷屏
+            echo "$errordisk" >> "$pri_dimm_info"
+            pub_messageAppend "$line" 2
+            if [ x"$pub_mce_threshold_reached" = "xyes" ]; then
+                [ x"$errordisk" != x"Mem ECC Error" ] && pub_errorSlot="$errordisk"
+                #pub_IdcFreeCreate "${uce}${errordisk}" "$errormsg" "2"
+                pub_IdcFreeCreate "${errordisk}" "$errormsg" "2"
+                pub_errorSlot=""
+            fi
+        fi
+    done < "$pri_sel_save_mem"
+
+    if grep -q "Uncorrectable" "$pri_sel_save_mem"; then
+        memstatus=$critical
+    elif [ x"$pub_mce_threshold_reached" = "xyes" ]; then
+        memstatus=$error
+    else
+        memstatus=$warning
+    fi
+    rm -f "$pri_dimm_info" "$pri_sel_save_mem"
+    echo "" | ${CMD_SUDO} ${CMD_TEE} "$pri_sel_save" >/dev/null # sel.save is created by root...
+}
+
+function pub_check_mcelog_lenovo() {
+	line=`cat $pub_sel_mem_tmp | tail -1`
+        pri_record=`echo $line| awk -F"|" '{print $1}' | sed 's/ //g'`
+	pri_record_len=`echo -n $pri_record | wc -c`
+	sensor_low=""
+    	sensor_hign=""
+   	case $pri_record_len in
+            1)
+                sensor_low="0x"$pri_record"" && sensor_hign="0x"00""
+                ;;
+            2)
+                sensor_low="0x"$pri_record"" && sensor_hign="0x"00""
+                ;;
+            3)
+                sensor_hign="0x"${pri_record:0:1}"" && sensor_low="0x"${dell_memrecord:1:4}""
+                ;;
+            4)
+                sensor_hign="0x"${pri_record:0:2}"" && sensor_low="0x"${dell_memrecord:2:4}""
+                ;;
+            *)
+                ;;
+        esac
+	server_model=`echo $pub_model | tr [a-z] [A-Z] | sed 's/ //g'`
+	case "$server_model" in
+	    *THINKSERVERRD640*)
+		cpu=""
+		dimm=""
+		if [ -n "$sensor_low" -a -n "$sensor_hign" ]; then
+                    sensor=`${CMD_SUDO} ${CMD_IPMITOOL} raw 0x0a 0x43 0x00 0x00 "$sensor_low" "$sensor_hign" 0x00 0xff | tail -1 | tr [a-z] [A-Z] | sed -e 's/^\s\+//;s/\s\+$//'`
+		    byte2_sensor=`echo $sensor | awk -F" " '{print $1}'`
+		    byte3_sensor=`echo $sensor | awk -F" " '{print $2}'`
+		    [[ "$byte2_sensor" == "00" ]] && cpu="CPU0 CHAN A"
+		    [[ "$byte2_sensor" == "01" ]] && cpu="CPU0 CHAN B"
+		    [[ "$byte2_sensor" == "02" ]] && cpu="CPU0 CHAN C"
+		    [[ "$byte2_sensor" == "03" ]] && cpu="CPU0 CHAN D"
+		    [[ "$byte2_sensor" == "04" ]] && cpu="CPU1 CHAN A"
+                    [[ "$byte2_sensor" == "05" ]] && cpu="CPU1 CHAN B"
+                    [[ "$byte2_sensor" == "06" ]] && cpu="CPU1 CHAN C"
+                    [[ "$byte2_sensor" == "07" ]] && cpu="CPU1 CHAN D"
+		    [[ "$byte3_sensor" == "00" ]] && dimm="DIMM 1"
+                    [[ "$byte3_sensor" == "01" ]] && dimm="DIMM 2"
+                    [[ "$byte3_sensor" == "02" ]] && dimm="DIMM 3"
+		    if [ x"$pub_mce_threshold_reached" = "xyes" ] && [ -n "$cpu" -a -n "$dimm" ]; then
+			pub_IdcFreeCreate "$cpu $dimm" "$cpu $dimm is error. | echo $line." "2"
+			pub_messageAppend "$cpu $dimm is error. | echo $line." 2
+			pub_messageSend "mem" "[ ERROR ]" "$line"
+		    elif [ x"$pub_mce_threshold_reached" = "xyes" ]; then
+			pub_IdcFreeCreate "MEM ECC ERROR" "echo $line." "2"
+                        pub_messageAppend "echo $line." 2
+			pub_messageSend "mem" "[ ERROR ]" "$line"
+		    fi
+		fi    
+		;;
+            *THINKSERVERSD340X*)
+                cpu=""
+                cha=""
+                dimm=""
+                if [ -n "$sensor_low" -a -n "$sensor_hign" ]; then
+                    sensor=`${CMD_SUDO} ${CMD_IPMITOOL} raw 0x0a 0x43 0x00 0x00 "$sensor_low" "$sensor_hign" 0x00 0xff | tail -1 | tr [a-z] [A-Z] | sed -e 's/^\s\+//;s/\s\+$//'`
+                    ed2=`echo $sensor | awk -F" " '{print $1}'`
+                    cpu=$(($((0x$ed2 & 0x40)) >> 6))
+                    cha=$(($((0x$ed2 & 0x38)) >> 3))
+                    dimm=$((0x$ed2 & 0x07))
+                    if [ x"$pub_mce_threshold_reached" = "xyes" ] && [ -n "$cpu" -a -n "$cha" -a -n "$dimm" ]; then
+                        pub_IdcFreeCreate "CPU$cpu CHA$cha DIMM$dimm" "CPU$cpu CHA$cha DIMM$dimm is error. | echo $line." "2"
+                        pub_messageAppend "CPU$cpu CHA$cha DIMM$dimm is error. | echo $line." 2
+                        pub_messageSend "mem" "[ ERROR ]" "$line"
+                    elif [ x"$pub_mce_threshold_reached" = "xyes" ]; then
+                        pub_IdcFreeCreate "MEM ECC ERROR" "echo $line." "2"
+                        pub_messageAppend "echo $line." 2
+                        pub_messageSend "mem" "[ ERROR ]" "$line"
+                    fi
+                fi
+                ;;
+            *THINKSERVERRD642X*)
+                cpu=""
+                cha=""
+                dimm=""
+                if [ -n "$sensor_low" -a -n "$sensor_hign" ]; then
+                    sensor=`${CMD_SUDO} ${CMD_IPMITOOL} raw 0x0a 0x43 0x00 0x00 "$sensor_low" "$sensor_hign" 0x00 0xff | tail -1 | tr [a-z] [A-Z] | sed -e 's/^\s\+//;s/\s\+$//'`
+                    ed2=`echo $sensor | awk -F" " '{print $1}'`
+                    ed3=`echo $sensor | awk -F" " '{print $2}' | tr [a-z] [A-Z]`
+                    cpu=$((0x$ed2))
+                    dimm=$ed3
+                    if [ x"$pub_mce_threshold_reached" = "xyes" ] && [ -n "$cpu" -a -n "$dimm" ]; then
+                        pub_IdcFreeCreate "CPU$cpu DIMM$dimm" "CPU$cpu DIMM$dimm is error. | echo $line." "2"
+                        pub_messageAppend "CPU$cpu DIMM$dimm is error. | echo $line." 2
+                        pub_messageSend "mem" "[ ERROR ]" "$line"
+                    elif [ x"$pub_mce_threshold_reached" = "xyes" ]; then
+                        pub_IdcFreeCreate "MEM ECC ERROR" "echo $line." "2"
+                        pub_messageAppend "echo $line." 2
+                        pub_messageSend "mem" "[ ERROR ]" "$line"
+                    fi
+                fi
+                ;;
+            *THINKSERVERRD452X*|*THINKSERVERSD350X*)
+                cpu=""
+                cha=""
+                dimm=""
+                if [ -n "$sensor_low" -a -n "$sensor_hign" ]; then
+                    sensor=`${CMD_SUDO} ${CMD_IPMITOOL} raw 0x0a 0x43 0x00 0x00 "$sensor_low" "$sensor_hign" 0x00 0xff | tail -1 | tr [a-z] [A-Z] | sed -e 's/^\s\+//;s/\s\+$//'`
+                    ed2=`echo $sensor | awk -F" " '{print $1}'`
+                    cpu=$(($((0x$ed2 & 0x40)) >> 6))
+                    cha=$(($((0x$ed2 & 0x38)) >> 3))
+                    dim=$((0x$ed2 & 0x07))
+                    if [ x"$pub_mce_threshold_reached" = "xyes" ] && [ -n "$cpu" -a -n "$cha" -n "$dim" ]; then
+                        pub_IdcFreeCreate "CPU$cpu CHA$cha DIMM$dim" "CPU$cpu CHA$cha DIMM$dim is error. | echo $line." "2"
+                        pub_messageAppend "CPU$cpu CHA$cha DIMM$dim is error. | echo $line." 2
+                        pub_messageSend "mem" "[ ERROR ]" "$line"
+                    elif [ x"$pub_mce_threshold_reached" = "xyes" ]; then
+                        pub_IdcFreeCreate "MEM ECC ERROR" "echo $line." "2"
+                        pub_messageAppend "echo $line." 2
+                        pub_messageSend "mem" "[ ERROR ]" "$line"
+                    fi
+                fi    
+                ;;
+	    *)
+                if [ x"$pub_mce_threshold_reached" = "xyes" ]; then
+                    pub_IdcFreeCreate "MEM ECC ERROR" "echo $line." "2"
+                    pub_messageAppend "echo $line." 2
+                    pub_messageSend "mem" "[ ERROR ]" "$line"
+                fi
+	        ;;
+	esac
+        if [ x"$pub_mce_threshold_reached" = "xyes" ]; then
+            memstatus=$error
+        fi
+}
+
+function pub_check_mcelog_huawei() {
+    local pri_hwdiag_ecc="/dev/shm/hwdiag_ecc.log.$suf"
+
+    [ -x "${CMD_HWDIAG}" ] || {
+        if grep -q "release 5" /etc/redhat-release; then
+            RHELVER=5
+        elif grep -q "release 6" /etc/redhat-release; then
+            RHELVER=6
+        else
+            # 只支持RHEL5/6的检查
+            return
+        fi
+        pub_check_download_server
+        if ${CMD_WGET} ${pub_server}/huawei/ISM-cli-tools.el${RHELVER}.tar.gz; then
+            ${CMD_SUDO} ${CMD_TAR} xf /tmp/ISM-cli-tools.el${RHELVER}.tar.gz -C /opt
+        else
+            # fallback to pub_check_mcelog_ipmi
+            pub_check_mcelog_ipmi
+            return
+        fi
+        [ -x "${CMD_HWDIAG}" ] || {
+            pub_check_mcelog_ipmi
+            return
+        }
+    }
+
+    ${CMD_SUDO} "${CMD_HWDIAG}" -t mem -d | grep -v '^\*\+$' | grep -vw 'ECC_Status' | grep -vw 'Ok' 2>/dev/null > "$pri_hwdiag_ecc"
+    ecc_count=0
+    while read line; do
+        echo $line | grep -q 'NO MEM' && continue # skip if no mem in this slot
+        if [ x"$1" = "xconfig_err" ] && echo $line | grep -q 'UNRECOGNIZE'; then
+            dimm=$(echo $line | awk '{ print $1 }')
+            pub_messageAppend "$line" 2
+            memstatus=$critical
+            pub_messageSend "mem" "[ CRITICAL ]" "$line"
+            pub_errorSlot="$dimm"
+            pub_IdcFreeCreate "$dimm" "$line" "2"
+            pub_errorSlot=""
+            continue
+        fi
+
+        dimm=$(echo $line | awk '{ print $1 }')
+        chid=$(echo $line | awk '{ print $2 }')
+        ddrtype=$(echo $line | awk '{ print $3 }')
+        memsize=$(echo $line | awk '{ print $4 $5 }')
+        ecctype=$(echo $line | awk '{ print $6 }')
+        eccstat=$(echo $line | awk '{ print $NF }')
+        manufac=$(${CMD_SUDO} ${CMD_HWDIAG} -t mem -i | grep "^$dimm" | awk '{ print $5 }')
+        serialn=$(${CMD_SUDO} ${CMD_HWDIAG} -t mem -i | grep "^$dimm" | awk '{ print $4 }')
+        ((ecc_count++))
+
+        errormsg1="${eccstat} ${ecctype} errors in ${dimm}, CPU/CHN/DIM=${chid}."
+        errormsg2="Manufacturer: ${manufac}; Size: ${memsize}; Type: ${ddrtype}; S/N: ${serialn}"
+        pub_messageAppend "${errormsg1}" 2
+        if pub_is_ecs_host; then
+            ecc_threshold=2000
+        elif [ x"$IS_HWQC" = "x1" ]; then
+            ecc_threshold=1
+        else
+            ecc_threshold=5000
+        fi
+        pub_errorSlot="$dimm"
+        if [ x"$ecctype" = "xUncorrectable" ]; then
+            [[ $memstatus -lt $critical ]] && memstatus=$critical
+            pub_messageSend "mem" "[ CRITICAL ]" "${errormsg1}"
+            #pub_IdcFreeCreate "UCE $dimm" "${errormsg1} ${errormsg2}" "2"
+            pub_IdcFreeCreate "$dimm" "${errormsg1} ${errormsg2}" "2"
+        elif [ x"$pub_mce_threshold_reached" = "xyes" ] && [ x"$ecctype" = "xOverflow" -o x"$ecctype" = "xCorrectable" -a "$eccstat" -ge "$ecc_threshold" ]; then
+            [[ $memstatus -lt $error ]] && memstatus=$error
+            pub_messageSend "mem" "[ ERROR ]" "${errormsg1}"
+            pub_IdcFreeCreate "$dimm" "${errormsg1} ${errormsg2}" "2"
+        else
+            [[ $memstatus -lt $warning ]] && memstatus=$warning
+            pub_messageSend "mem" "[ WARNING ]" "${errormsg1}"
+        fi
+        pub_errorSlot=""
+    done < "$pri_hwdiag_ecc"
+
+    if [ $ecc_count -eq 0 ] && (pub_is_ecs_host || [ x"$IS_HWQC" = "x1" ]); then
+        pub_check_mcelog_ipmi
+    fi
+
+    rm -f "${pri_hwdiag_ecc}" &>/dev/null
+}
+
+function pub_check_mcelog_hp_ibm_dell() {
+    while read line; do
+        dimm=`echo $line | awk -F"| Memory " '{ print $2}' | awk -F\| '{ print $1 }' | sed -e 's/^\s\+//;s/\s\+$//'`
+        #echo $dimm | grep -qi "DIMM" && errordisk="${dimm}" || errordisk="Mem ECC Error"
+        echo $dimm | grep -qi "DIMM" && errordisk=`echo $dim | sed 's/Status//g'` || errordisk="Mem ECC Error"
+        [ x"$errordisk" != x"Mem ECC Error" ] && pub_errorSlot="$errordisk" 
+        vendor=`echo $pub_vendor | tr [a-z] [A-Z]`
+        if echo $line | grep -q "Uncorrectable"; then
+            case "$vendor" in 
+                *DELL*)
+                    record=`echo $line | awk -F"|" '{print $1}'`
+                    pub_check_dell_slot "$record" "$line" "Uncorrectable"
+                    ;;
+                *)                            
+                    pub_messageSend "mem" "[ CRITICAL ]" "Uncorrectable ECC found!"
+                    pub_messageAppend "Uncorrectable ECC found" 2
+                    #pub_IdcFreeCreate "UCE $errordisk" "(Login to web oob to get accurate DIMM) | $line" "2"
+                    pub_IdcFreeCreate "$errordisk" "(Login to web oob to get accurate DIMM) | $line" "2"
+                    ;;
+            esac
+        else
+            case "$vendor" in 
+                *DELL*)
+                    record=`echo $line | awk -F"|" '{print $1}'`
+                    pub_check_dell_slot "$record" "$line" "Correctable"
+                    ;;
+                *)
+                    pub_messageSend "mem" "[ ERROR ]" "Correctable ECC found!"
+                    pub_messageAppend "Correctable ECC found" 2
+                    pub_IdcFreeCreate "$errordisk" "(Login to web oob to get accurate DIMM) | $line" "2"
+                    ;;
+            esac
+        fi
+        pub_errorSlot=""
+    done < "$pub_sel_mem_tmp"
+
+    if grep -q "Uncorrectable" "$pub_sel_mem_tmp"; then
+        memstatus=$critical
+    else
+        memstatus=$error
+    fi
+}
+#by luxue
+#to check dell mem slot.
+function pub_check_dell_slot(){
+    local dell_memrecord=`echo $1 | sed -e 's/^\s\+//;s/\s\+$//'`
+    local dell_meminfo=$2
+    local dell_memtype=$3
+    local cpu=""
+    local ch=""
+    local dim=""
+    
+    record_len=`echo -n $dell_memrecord | wc -c`
+    sensor_low=""
+    sensor_hign=""
+    case $record_len in
+        1)
+            sensor_low="0x"$dell_memrecord"" && sensor_hign="0x"00""
+            ;;
+        2)
+            sensor_low="0x"$dell_memrecord"" && sensor_hign="0x"00""
+            ;;
+        3)
+            sensor_hign="0x"${dell_memrecord:0:1}"" && sensor_low="0x"${dell_memrecord:1:4}""
+            ;;
+        4)
+            sensor_hign="0x"${dell_memrecord:0:2}"" && sensor_low="0x"${dell_memrecord:2:4}""
+            ;;
+        *)
+            ;;
+    esac
+    server_model=`echo $pub_model | tr [a-z] [A-Z]` 
+    case "$server_model" in 
+        *CS24-TY*|*FS12-TY*|*C5220*)
+            if [ -n "$sensor_low" -a -n "$sensor_hign" ]; then
+                sensor=`${CMD_SUDO} ${CMD_IPMITOOL} raw 0x0a 0x43 0x00 0x00 "$sensor_low" "$sensor_hign" 0x00 0xff | awk -F" " '{print $NF}'`
+                sensor_num=`echo $sensor | awk -F" " '{print $NF}' | sed 's/ //g'`
+                cpu=$((0x$sensor_num / 10))
+                ch=$(echo $(((0x$sensor_num-1)/3)) | awk '{printf("%c",$1+65)}')
+                dim=$(((0x$sensor_num-1)%3))
+            fi
+            if [ -n "$cpu" -a -n "$ch" -a -n "$dim" ]; then
+                errormem="CPU$cpu/CH$ch/DIM_$ch$dim"
+            fi                
+            ;;
+        *R720XD*|*DCS2210*|*R620*|*R720*)
+            if [ -n "$sensor_low" -a -n "$sensor_hign" ]; then 
+                sensor=`${CMD_SUDO} ${CMD_IPMITOOL} raw 0x0a 0x43 0x00 0x00 "$sensor_low" "$sensor_hign" 0x00 0xff | tail -1 | tr [a-z] [A-Z] | sed -e 's/^\s\+//;s/\s\+$//'`
+                [[ "$sensor" == "C0 01" ]] && dim="DIM A1"
+                [[ "$sensor" == "C0 02" ]] && dim="DIM A2"
+                [[ "$sensor" == "C0 04" ]] && dim="DIM A3"
+                [[ "$sensor" == "C0 08" ]] && dim="DIM A4"
+                [[ "$sensor" == "C0 10" ]] && dim="DIM A5"
+                [[ "$sensor" == "C0 20" ]] && dim="DIM A6"
+                [[ "$sensor" == "C0 40" ]] && dim="DIM A7"
+                [[ "$sensor" == "C0 80" ]] && dim="DIM A8"
+                [[ "$sensor" == "C1 01" ]] && dim="DIM A9"
+                [[ "$sensor" == "C1 02" ]] && dim="DIM A10"
+                [[ "$sensor" == "C1 04" ]] && dim="DIM A11"
+                [[ "$sensor" == "C1 08" ]] && dim="DIM A12"
+                [[ "$sensor" == "C1 10" ]] && dim="DIM B1"
+                [[ "$sensor" == "C1 20" ]] && dim="DIM B2"
+                [[ "$sensor" == "C1 40" ]] && dim="DIM B3"
+                [[ "$sensor" == "C1 80" ]] && dim="DIM B4"
+                [[ "$sensor" == "C2 01" ]] && dim="DIM B5"
+                [[ "$sensor" == "C2 02" ]] && dim="DIM B6"
+                [[ "$sensor" == "C2 04" ]] && dim="DIM B7"
+                [[ "$sensor" == "C2 08" ]] && dim="DIM B8"
+                [[ "$sensor" == "C2 10" ]] && dim="DIM B9"
+                [[ "$sensor" == "C2 20" ]] && dim="DIM B10"
+                [[ "$sensor" == "C2 40" ]] && dim="DIM B11"
+                [[ "$sensor" == "C2 80" ]] && dim="DIM B12"
+            fi
+            if [ -n "$dim" ]; then
+                errormem="$dim"
+            fi    
+            ;;
+        *C6220*|*DCS6220*|*R900*)
+            if [ -n "$sensor_low" -a -n "$sensor_hign" ]; then
+                sensor=`${CMD_SUDO} ${CMD_IPMITOOL} raw 0x0a 0x43 0x00 0x00 "$sensor_low" "$sensor_hign" 0x00 0xff | tail -1 | tr [a-z] [A-Z] | sed -e 's/^\s\+//;s/\s\+$//'`
+                sensordata2=`echo $sensor | awk -F" " '{print $1}'`
+                sensordata3=`echo $sensor | awk -F" " '{print $2}'`
+                cpu=$(echo $((0x$sensordata2 & 0x0f)) | awk '{printf("%d",$1+1)}')
+                dim_sensordata3=$sensordata3
+                for ((i=1; i<=8; i++)); do
+                    dimsensor=$((dim_sensordata3 & 0x01)) 
+                    [ $dimsensor == 1 ] && break
+                    dim_sensordata3=$((dim_sensordata3 >> 1))
+                done
+                dim=$i
+                if [ -n "$cpu" -a -n "$dim" ]; then
+                    errormem="CPU$cpu DIM$dim"
+                fi
+            fi
+            ;;
+        *R410*|*R510*|*1950*|*2950*) 
+            if [ -n "$sensor_low" -a -n "$sensor_hign" ]; then
+                sensor=`${CMD_SUDO} ${CMD_IPMITOOL} raw 0x0a 0x43 0x00 0x00 "$sensor_low" "$sensor_hign" 0x00 0xff | tail -1 | tr [a-z] [A-Z] | sed -e 's/^\s\+//;s/\s\+$//' | sed 's/ //g'`
+                [[ $sensor == "8001" ]] && dim="DIM A1"
+                [[ $sensor == "8002" ]] && dim="DIM A2"
+                [[ $sensor == "8004" ]] && dim="DIM A3"
+                [[ $sensor == "8008" ]] && dim="DIM A4"
+                [[ $sensor == "8010" ]] && dim="DIM B1"
+                [[ $sensor == "8020" ]] && dim="DIM B2"
+                [[ $sensor == "8040" ]] && dim="DIM B3"
+                [[ $sensor == "8080" ]] && dim="DIM B4"
+            fi
+            if [ -n "$dim" ]; then
+                errormem="$dim"
+            fi
+            ;;
+        *M610*|*R610*|*C6100*|*DCS6100*)
+            if [ -n "$sensor_low" -a -n "$sensor_hign" ]; then
+                sensor=`${CMD_SUDO} ${CMD_IPMITOOL} raw 0x0a 0x43 0x00 0x00 "$sensor_low" "$sensor_hign" 0x00 0xff | tail -1 | tr [a-z] [A-Z] | sed -e 's/^\s\+//;s/\s\+$//' | sed 's/ //g'`
+                [[ $sensor == "9001" ]] && dim="DIM A1"
+                [[ $sensor == "9002" ]] && dim="DIM A2"
+                [[ $sensor == "9004" ]] && dim="DIM A3"
+                [[ $sensor == "9008" ]] && dim="DIM A4"
+                [[ $sensor == "9010" ]] && dim="DIM A5"
+                [[ $sensor == "9020" ]] && dim="DIM A6"
+                [[ $sensor == "9040" ]] && dim="DIM B1"
+                [[ $sensor == "9080" ]] && dim="DIM B2"
+                [[ $sensor == "9101" ]] && dim="DIM B3"
+                [[ $sensor == "9102" ]] && dim="DIM B4"
+                [[ $sensor == "9104" ]] && dim="DIM B5"
+                [[ $sensor == "9108" ]] && dim="DIM B6" 
+            fi
+            if [ -n "$dim" ]; then
+                errormem="$dim"
+            fi
+            ;;
+        *R710*|*C2100*)
+            if [ -n "$sensor_low" -a -n "$sensor_hign" ]; then
+                sensor=`${CMD_SUDO} ${CMD_IPMITOOL} raw 0x0a 0x43 0x00 0x00 "$sensor_low" "$sensor_hign" 0x00 0xff | tail -1 | tr [a-z] [A-Z] | sed -e 's/^\s\+//;s/\s\+$//' | sed 's/ //g'`
+                [[ $sensor == "B001" ]] && dim="DIM A1"
+                [[ $sensor == "B002" ]] && dim="DIM A2"
+                [[ $sensor == "B004" ]] && dim="DIM A3"
+                [[ $sensor == "B008" ]] && dim="DIM A4"
+                [[ $sensor == "B010" ]] && dim="DIM A5"
+                [[ $sensor == "B020" ]] && dim="DIM A6"
+                [[ $sensor == "B040" ]] && dim="DIM A7"
+                [[ $sensor == "B080" ]] && dim="DIM A8"
+                [[ $sensor == "B101" ]] && dim="DIM A9"
+                [[ $sensor == "B102" ]] && dim="DIM B1"
+                [[ $sensor == "B104" ]] && dim="DIM B2"
+                [[ $sensor == "B108" ]] && dim="DIM B3"
+                [[ $sensor == "B110" ]] && dim="DIM B4"
+                [[ $sensor == "B120" ]] && dim="DIM B5"
+                [[ $sensor == "B140" ]] && dim="DIM B6"
+                [[ $sensor == "B180" ]] && dim="DIM B7"
+                [[ $sensor == "B201" ]] && dim="DIM B8"
+                [[ $sensor == "B202" ]] && dim="DIM B9"
+            fi
+            if [ -n "$dim" ]; then
+                errormem="$dim"
+            fi
+            ;;
+        *)
+            ;;
+    esac
+
+    errordisk=`echo $dell_meminfo`
+    pub_errorSlot="$errormem"
+
+    [[ $dell_memtype == "Uncorrectable" ]] && pub_messageSend "mem" "[ CRITICAL ]" "$dell_memtype error found! $errordisk."
+    [[ $dell_memtype == "Mem ECC Warning" ]] && pub_messageSend "mem" "[ CRITICAL ]" "$dell_memtype error found! $errordisk."
+    [[ $dell_memtype == "Correctable" ]] && pub_messageSend "mem" "[ ERROR ]" "$dell_memtype error found! $errordisk."
+    pub_messageAppend "$dell_memtype error found" 2
+    if [ -n "$errormem" ]; then
+        pub_IdcFreeCreate "$errormem" "$errormem is error. | $errordisk." "2"
+    else
+        pub_IdcFreeCreate "$dell_memtype error" "(Login to web oob to get accurate DIMM) | $errordisk." "2"
+    fi
+    pub_errorSlot=""
+}
+
+#
+#by luxue
+#check huawei ecc slot which are not check by hwdiag
+function pub_check_huawei_slot(){
+    local huawei_sensors="/dev/shm/huawei_sensors.log"
+    local sensors="/dev/shm/sensors.log"
+    local huawei_meminfo=$1
+    local huwei_memtype=$2
+    local dimm=""
+
+    [ -e $sensors ] || ${CMD_SUDO} ${CMD_TOUCH} $sensors 2>/dev/null
+    cat $huawei_meminfo | grep "$2" | awk -F"|" '{print $4}' | awk -F"0x" '{print $NF}' | tr '[a-z]' '[A-Z]' > $huawei_sensors
+    for i in `cat $huawei_sensors`; do
+        cat $sensors | grep -q $i
+        if [ $? -ne 0 ]; then
+            echo $i >> $sensors
+        fi
+    done
+    for i in `cat $sensors`; do
+        dimm=`${CMD_SUDO} ${CMD_IPMITOOL} sdr elist | grep "$i"h | awk -F"|" '{print $1}'`
+        pub_errorSlot="$dimm"
+        if [ -n "$dimm" ]; then
+            memstatus=$error
+            pub_messageSend "mem" "[ ERROR ]" "$huwei_memtype ECC found. DIMM: $dimm"
+            pub_messageAppend "$huwei_memtype ECC found. DIMM: $dimm." 2
+            pub_IdcFreeCreate "$dimm" "$huwei_memtype ECC found! DIMM: $dimm | `cat $huawei_meminfo`" "2"
+        else
+            memstatus=$error
+            pub_messageSend "mem" "[ ERROR ]" "$huwei_memtype ECC found! Mem sensor num is "$i"h."
+            pub_messageAppend "$huwei_memtype ECC found" 2
+            pub_IdcFreeCreate "$huwei_memtype ecc" "$huwei_memtype ECC found! | `cat $huawei_meminfo`." "2"
+        fi
+        pub_errorSlot=""
+    done
+
+    rm -f $huawei_sensors $sensors &>/dev/null
+}
+#by luxue
+#check quanta mem slot
+function pub_check_quanta_slot(){
+    local meminfo=$1
+    local memtype=$2
+    echo "$pub_model" | tr [a-z] [A-Z] | grep -qE "S2RQ|S2L|L02B-10G-SH|L02B-1G-SH|L02B-1G-A|L02B-1G-SF"
+    if [ $? -eq 0 ]; then
+        record=`cat $meminfo |grep "$memtype" | tail -1| awk -F"|" '{print $1}'`
+        if [-n `echo $record` ]; then
+            for i in `echo $record`; do
+                record_len=`echo -n $i | wc -c`
+                sensor_low=""
+                sensor_hign=""
+                cpu=""
+                ch=""
+                dimm=""
+                case $record_len in
+                    1) 
+                        sensor_low="0x"$i"" && sensor_hign="0x"00""
+                        ;;
+                    2) 
+                        sensor_low="0x"$i"" && sensor_hign="0x"00""
+                        ;;
+                    3) 
+                        sensor_hign="0x"${i:0:1}"" && sensor_low="0x"${i:1:4}""
+                        ;;
+                    4) 
+                        sensor_hign="0x"${i:0:2}"" && sensor_low="0x"${i:2:4}""
+                        ;;
+                    *)
+                        ;;
+                esac
+                sensor=`${CMD_SUDO} ${CMD_IPMITOOL} raw 0x0a 0x43 0x00 0x00 "$sensor_low" "$sensor_hign" 0x00 0xff | awk -F" " '{print $NF}'`
+                sensor_num=`echo $sensor | awk -F" " '{print $NF}'`
+                cpu=$(((0x$sensor_num >> 6) & 0x3))
+                ch=$(((0x$sensor_num >> 3) & 0x7))
+                dim=$((0x$sensor_num & 0x7)) 
+                if [ x"$pub_mce_threshold_reached" = "xyes" ] && [ -n "$cpu" -a -n "$ch" -a -n "$dimm" ]; then
+                    errordisk="$cpu/$ch/$dim"
+                    pub_errorSlot="$errordisk"
+                    pub_messageSend "mem" "[ CRITICAL ]" "$memtype ECC found! $errordisk is error."
+                    pub_messageAppend "$memtype ECC found" 2
+                    pub_IdcFreeCreate "$errordisk" "$memtype ECC found! $errordisk is error.| `cat $meminfo`" "2"
+                    pub_errorSlot=""
+                elif [ x"$pub_mce_threshold_reached" = "xyes" ]; then
+                    errordisk=`cat $meminfo`
+                    pub_messageSend "mem" "[ CRITICAL ]" "$memtype ECC found!"
+                    pub_messageAppend "$memtype ECC found" 2
+                    pub_IdcFreeCreate "$memtype ECC" "(Login to web oob to get accurate DIMM) | $errordisk" "2"
+                fi
+            done
+        fi   
+    elif [ x"$pub_mce_threshold_reached" = "xyes" ]; then
+       pub_messageSend "mem" "[ CRITICAL ]" "$memtype ECC found!"
+       pub_messageAppend "$memtype ECC found" 2
+       pub_IdcFreeCreate "$memtype ECC Error" "(Login to web oob to get accurate DIMM) | `cat $meminfo`" "2"
+    fi
+    if [ x"$pub_mce_threshold_reached" = "xyes" ]; then
+        memstatus=$error
+    fi
+}
+function pub_check_mcelog_ipmi() {
+    if [ `cat "$pub_sel_mem_tmp" 2>/dev/null | wc -l` -eq 0 ]; then
+        return
+    fi
+    vendor=`echo $pub_vendor | tr [a-z] [A-Z]`
+    if grep -q "Uncorrectable" "$pub_sel_mem_tmp"; then
+        #echo "$pub_vendor" | grep -qE "huawei|HUAWEI"
+        case "$vendor" in 
+            *HUAWEI*)
+                pub_check_huawei_slot "$pub_sel_mem_tmp" "Uncorrectable"
+                ;;
+            *QUANTA*)
+                pub_check_quanta_slot "$pub_sel_mem_tmp" "Uncorrectable"
+                ;;
+            *)
+                if [ x"$pub_mce_threshold_reached" = "xyes" ]; then 
+                    memstatus=$critical
+                    pub_messageSend "mem" "[ CRITICAL ]" "Uncorrectable ECC found!"
+                    pub_messageAppend "Uncorrectable ECC found" 2
+                    pub_IdcFreeCreate "UCE Mem ECC Error" "(Login to web oob to get accurate DIMM) | `cat $pub_sel_mem_tmp`" "2"
+                fi
+                ;;
+        esac
+    else
+        if [ x"$pub_mce_threshold_reached" = "xyes" ]; then
+            #echo "$pub_vendor" | grep -qE "huawei|HUAWEI"
+            #if [ $? -eq 0 ]; then
+            case "$vendor" in
+                *HUAWEI*)
+                    pub_check_huawei_slot "$pub_sel_mem_tmp" "Correctable"
+                    ;;
+                *QUANTA*)
+                    pub_check_quanta_slot "$pub_sel_mem_tmp" "Correctable"
+                    ;;
+                *)
+                    memstatus=$error
+                    pub_messageSend "mem" "[ ERROR ]" "Correctable ECC found!"
+                    pub_messageAppend "Correctable ECC found" 2
+                    pub_IdcFreeCreate "Mem ECC Error" "(Login to web oob to get accurate DIMM) `cat $pub_sel_mem_tmp`" "2"
+                    ;;
+            esac
+        else
+            memstatus=$warning
+            pub_messageSend "mem" "[ WARNING ]" "Correctable ECC found!"
+            pub_messageAppend "Correctable ECC found" 2
+        fi
+    fi
+}
+
+#阿里云磁盘卸载逻辑（由于在其他方法中调用本方法没有区分阿里云/淘宝服务器，因此这里必须执行服务器检查，以便不把淘宝服务器给umount了）
+function pub_aliyun_umountDir() {
+    local pri_dev=$1
+    # local pri_atrr=$2
+    local pri_dir
+    if ${CMD_SUDO} [ -f /home/admin/aresolve/apsarad ] ; then
+        pri_dir=`grep -E 'ext3|ext4' /proc/self/mounts|grep -v -w nfs|grep -v /dev/nbd|grep -v /dev/drbd|grep -v -w /|grep -v -w /boot |grep $pri_dev|awk '{print $2}'`
+        if [[ "$pri_dir" != "/apsara" && "$pri_dir" != "/" && "$pri_dir" != "/apsarapangu" && ! -z $pri_dir ]] ; then
+            ${CMD_SUDO} ${CMD_UMOUNT} -l $pri_dir &>/dev/null
+            if [ $? -ne 0 ]; then
+                pub_logfileAppend "$pri_dir umount failed!"
+            else
+                pub_logfileAppend "$pri_dir umounted successfully."
+                # if [ x$pri_atrr = x1 ]; then
+                    # chattr +i $pri_dir
+                # fi
+            fi
+        fi
+    fi
+}
+
+function pub_messages_errordisk() {
+    local pri_disk="$1"
+    local pri_error_type="$2"
+    local pri_disk_log
+    local logmessages="/dev/shm/messages.log.$suf"
+    local errorfilelog="/dev/shm/errorfile.log"
+
+    # cciss/c0d0p1, md1, etc
+    echo "$pri_disk" | grep -qE "/c[0-9]d[0-9]$|md[0-9]$" || pri_disk=`echo "$pri_disk"|sed -e 's/[0-9]\+$\|p[0-9]\+$//g'|sed 's/:$//'`
+
+    # avoid duplication
+    if [ -z "$pub_error_disk" ]; then
+        pub_error_disk=$pri_disk
+    elif echo "$pub_error_disk" | grep -qw $pri_disk; then
+        return 1
+    else
+        pub_error_disk="$pub_error_disk,$pri_disk"
+    fi
+
+    # input : pri_disk
+    # output: pub_disk_string
+    pub_check_slot "/dev/$pri_disk" ""
+
+    pri_disk_log=$(cat $logmessages 2>/dev/null | grep "$pri_error_type" | grep "$pri_disk" | tail -1)
+    diskstatus=$warning
+    pub_messageAppend "$pri_disk has $pri_error_type" 1
+    pub_messageSend "storage" "[ WARNING ]" "$pri_disk has $pri_error_type"
+
+    # 单盘RAID0
+    # Aliyun System (full_disk_check == 0)
+    # Other System  (full_disk_check == 1)
+
+    # 对于单盘RAID0，会出现重复报修，因此只报警，不报修
+    if [ x"$IS_HWQC" != "x1" ]; then
+    [ -e ${pub_chkhw_logdir}/raidcard ] && grep -q "raidcard" ${pub_chkhw_logdir}/raidcard && return 1
+    full_disk_check=1
+    local pri_group=$(pub_Armory_group)
+    if [ "$pri_group" == "no_armory_result" ]; then
+        ${CMD_SUDO} [ -d /home/mapred/hadoop-current/ ] && full_disk_check=0
+        ${CMD_SUDO} [ -x /home/admin/dayu/bin/apsarad ] && full_disk_check=0
+    elif echo $pri_group | grep -iqE "$pub_smartctl_group"; then
+        full_disk_check=0
+    fi
+    
+    if [ $full_disk_check -eq 0 ]; then #阿里云服务器，smartctl Failed才报修，否则忽略
+        if [ -x ${CMD_SMARTCTL} ]; then
+            ${CMD_SUDO} ${CMD_SMARTCTL} -H /dev/$pri_disk &>/dev/null
+            [ $? -eq 0 ] && return 1
+        fi
+    elif [ $full_disk_check -eq 1 ]; then #默认情况，Medium Error一个就报修，I/O error每小时出现5次才报修
+        if echo "$pri_error_type" | grep -qi "I/O error"; then
+            local pri_error_count=$(cat $logmessages 2>/dev/null | grep "$pri_error_type" | grep "$pri_disk" | wc -l)
+            [ $pri_error_count -lt 5 ] && return 1
+        fi
+    fi
+    fi
+
+    diskstatus=$error
+    error_msg="$pub_disk_string | Log: $pri_disk_log"
+    #pub_errorSlot="`echo $pub_slot | cut -d, -f1 | sed 's/ //g'`"
+    errorslot=`echo $pub_slot | awk -F"," '{print $1}' | sed 's/ //g'`
+    errordiskinfo=`echo $pub_slot | awk -F"," '{print $2}' | sed -e 's/[a-z]\|[A-Z]//g'| sed 's/ //g'`
+    echo -e "===================IDC===================\nSlot: $errorslot\nDisk SN: $pub_disk_sn\nDisk Model: $pub_disk_model\nDisk Size: $pub_disk_size\nDisk Type: $pub_disk_type\nVendor: $pub_disk_manu\n\n==================Device==================\nDevice: /dev/$pri_disk\nDisk Lable: disk$errordiskinfo\n\n================Error Info================\n$error_msg" > $errorfilelog
+    #pub_IdcFreeCreate "/dev/$pri_disk" "$error_msg" "1" "$pub_disk_raw"
+    if [ -n "$errorslot" ]; then
+        pub_errorSlot="`echo $pub_slot | cut -d, -f1 | sed 's/ //g'`"
+        pub_IdcFreeCreate "$errorslot" "`cat $errorfilelog`" "1" "$pub_disk_raw"
+    else
+        pub_IdcFreeCreate "/dev/$pri_disk" "`cat $errorfilelog`" "1" "$pub_disk_raw"
+    fi
+    rm -f $errorfilelog
+    pub_disk_raw=""
+    pub_errorSlot=""
+}
+
+#检查/var/log/message搜索Medium Error及或执行smartctl检查故障/云服务器卸载分区等
+#检查fstab与Label，试图发现已经坏了的磁盘(/dev/sdb这样的块设备文件都没了),搜索/var/log/message里磁盘offline|dead|medium等消息
+function pub_check_messages() {
+    local pri_date="$(date '+%b %e')|$(date -d '1 day ago' '+%b %e')"
+
+    # e.g.: RamOS
+    #if ([ x"$IS_RAMOS" = "xYES" ] || [ x"$IS_HWQC" = "x1" ]) && [ ! -e /var/log/messages ]; then
+     if [ x"$IS_RAMOS" = "xYES" ] || [ x"$IS_HWQC" = "x1" ]; then
+        dmesg > /var/log/messages
+        local pri_date=""
+    fi
+    test -d ${pub_chkhw_logdir} || ${CMD_SUDO} ${CMD_MKDIR} -p ${pub_chkhw_logdir} 2>/dev/null
+    st=`${CMD_SUDO} ${CMD_TOUCH} ${pub_chkhw_logdir}/check_harddisk 2>&1`
+    if [ $? -ne 0 ]; then
+        if ! echo $st | grep -qi "No space"; then
+            filesystem_readonly_flag="YES"
+            #filesystem_disk_error="YES"
+            dmesg > /dev/shm/dmesg
+            local pri_date=""
+        fi
+    fi
+
+    # EDAC often causes flooding logging, while the logs are not helpful at all.
+    # When edac flooding log happens, we'll do the following things:
+    # + report a Memory failure occurs
+    # + disable edac in system
+    local pri_edac_log
+    local pri_edac_line
+    local pri_edac_msg
+    if [ x"$filesystem_readonly_flag" = "xYES" ]; then
+        pri_edac_line=$(${CMD_SUDO} tail -n 6000 /dev/shm/dmesg | grep -E 'EDAC MC|Machine Check Exception.*Bank|HANDLING MCE MEMORY ERROR|TSC.*ADDR.*MISC.*PROCESSOR|EDAC sbridge' 2>/dev/null | grep -cE "$pri_date" 2>/dev/null)
+    else
+        pri_edac_line=$(${CMD_SUDO} tail -n 6000 /var/log/messages | grep -E 'EDAC MC|Machine Check Exception.*Bank|HANDLING MCE MEMORY ERROR|TSC.*ADDR.*MISC.*PROCESSOR|EDAC sbridge' 2>/dev/null | grep -cE "$pri_date" 2>/dev/null)
+    fi
+    if [ "$pri_edac_line" -gt 3000 ] || [ x"$IS_HWQC" = "x1" -a "$pri_edac_line" -gt 1000 ]; then
+        pub_mce_threshold_reached="yes"
+
+        # disable edac in system
+        if ! grep -qE "edac_core|sb_edac" /etc/modprobe.d/blacklist.conf 2>/dev/null; then
+            echo "# disable edac in SNB/IVB platform" | ${CMD_SUDO} ${CMD_TEE} -a /etc/modprobe.d/blacklist.conf >/dev/null 2>&1
+            echo "blacklist edac_core" | ${CMD_SUDO} ${CMD_TEE} -a /etc/modprobe.d/blacklist.conf >/dev/null 2>&1
+            echo "blacklist sb_edac" | ${CMD_SUDO} ${CMD_TEE} -a /etc/modprobe.d/blacklist.conf >/dev/null 2>&1
+        fi
+
+        # report error
+        if echo "$pub_vendor" | grep -vqiE "Huawei|Inventec|Inspur"; then
+            memstatus=$error
+            pri_edac_msg="EDAC reports $pri_edac_line errors, check web-OOB or system to locate broken DIMM."
+            pub_messageAppend "$pri_edac_msg" 2
+            pub_IdcFreeCreate "edac" "$pri_edac_msg" 2
+            pub_messageSend "mem" "[ ERROR ]" "$pri_edac_msg"
+	fi
+    else
+        local pri_total_date="$(date '+%b %e')|$(date -d '1 day ago' '+%b %e')|$(date -d '2 day ago' '+%b %e')|$(date -d '3 day ago' '+%b %e')|$(date -d '4 day ago' '+%b %e')|$(date -d '5 day ago' '+%b %e')|$(date -d '6 day ago' '+%b %e')"
+	total_edac_line=`cat /var/log/messages 2>/dev/null | grep -cE "$pri_total_date"| grep -E 'EDAC MC|Machine Check Exception.*Bank|HANDLING MCE MEMORY ERROR|TSC.*ADDR.*MISC.*PROCESSOR|EDAC sbridge' | wc -l`
+	if [ "$total_edac_line" -gt 2000 ]; then
+            pub_mce_threshold_reached="yes"
+            if echo "$pub_vendor" | grep -vqiE "Huawei|Inventec|Inspur"; then
+                pub_messageSend "mem" "[ ERROR ]" "mcelog errors detected."
+                pub_messageAppend "mcelog errors detected." 2
+                memstatus=$error
+                pub_IdcFreeCreate "mcelog" "mcelog errors detected, login to winoob or check /var/log/mcelog to get accurate DIMM" "2"
+            fi
+        fi
+    fi
+
+    #从messages中取出上次检查行之后的所有行，保存到/dev/shm/messages.log中，假如找不到上次检查的行则全取
+    local logmessages="/dev/shm/messages.log.$suf"
+    local msg_baselog="${pub_chkhw_logdir}/basemessages"
+    local msg_current="/dev/shm/messages_curr.log.$suf"
+    local msg_increment="/dev/shm/messages_incr.log.$suf"
+
+    test -e $msg_baselog || ${CMD_SUDO} ${CMD_TOUCH} $msg_baselog 2>/dev/null
+
+    # 取当前日志到文件msg_current
+    if [ "$(du -m /var/log/messages | awk '{ print $1 }')" -gt 200 ]; then
+        if [ x"$IS_RAMOS" = "xYES" ] || [ x"$IS_HWQC" = "x1" ]; then
+           ${CMD_SUDO} tail -n 200000 /var/log/messages |\
+            grep -vE "checkhw|hdmon|snoopy|sudo|HWBMC" |\
+            grep -vE "EDAC MC|Machine Check Exception.*Bank|HANDLING MCE MEMORY ERROR|TSC.*ADDR.*MISC.*PROCESSOR" |\
+            grep -vE "EDAC sbridge|\[[0-9\.]+][ ]+$" > $msg_current 2>/dev/null 
+        else
+        # if log is too big (such as 200MB+), fetch last 200,000 lines
+        ${CMD_SUDO} tail -n 200000 /var/log/messages |\
+            grep -w "kernel:" |\
+            grep -vE "checkhw|hdmon|snoopy|sudo|HWBMC" |\
+            grep -vE "EDAC MC|Machine Check Exception.*Bank|HANDLING MCE MEMORY ERROR|TSC.*ADDR.*MISC.*PROCESSOR" |\
+            grep -vE "EDAC sbridge|\[[0-9\.]+][ ]+$" > $msg_current 2>/dev/null
+        fi
+    else
+        if [ x"$IS_RAMOS" = "xYES" ] ||[ x"$IS_HWQC" = "x1" ]; then
+            ${CMD_SUDO} grep -vE "checkhw|hdmon|snoopy|sudo|HWBMC" /var/log/messages |\
+            grep -vE "EDAC MC|Machine Check Exception.*Bank|HANDLING MCE MEMORY ERROR|TSC.*ADDR.*MISC.*PROCESSOR" |\
+            grep -vE "EDAC sbridge|\[[0-9\.]+][ ]+$" > $msg_current 2>/dev/null
+        else 
+        ${CMD_SUDO} grep -w "kernel:" /var/log/messages |\
+            grep -vE "checkhw|hdmon|snoopy|sudo|HWBMC" |\
+            grep -vE "EDAC MC|Machine Check Exception.*Bank|HANDLING MCE MEMORY ERROR|TSC.*ADDR.*MISC.*PROCESSOR" |\
+            grep -vE "EDAC sbridge|\[[0-9\.]+][ ]+$" > $msg_current 2>/dev/null
+        fi
+    fi
+    if [ x"$filesystem_readonly_flag" = "xYES" ]; then
+        msg_baselog="/dev/shm/base_dmesg"
+        test -e $msg_baselog || ${CMD_SUDO} ${CMD_TOUCH} $msg_baselog 2>/dev/null
+        ${CMD_SUDO} grep -vE "checkhw|hdmon|snoopy|sudo|HWBMC" /dev/shm/dmesg |\
+                grep -vE "EDAC MC|Machine Check Exception.*Bank|HANDLING MCE MEMORY ERROR|TSC.*ADDR.*MISC.*PROCESSOR" |\
+                grep -vE "EDAC sbridge|\[[0-9\.]+][ ]+$" > $msg_current 2>/dev/null
+    fi
+
+    test -e $msg_current && diff $msg_baselog $msg_current|grep '^>'|sed 's/^>//g' > $msg_increment 2>/dev/null
+
+    if [ -z "$(cat $msg_increment 2>/dev/null)" ]; then
+        rm -f $msg_increment &>/dev/null
+        return
+    fi
+
+    cat $msg_increment 2>/dev/null | grep -E "$pri_date" > $logmessages 2>/dev/null
+	
+    nicfilename="/dev/shm/nicinfo_file"
+    if [ -e $nicfilename ]; then
+	temp=`cat $nicfilename | head -1 | awk -F":" '{print $NF}' | sed 's/ //g'`
+	nowtime=$(date +%H)
+	if [ 0x"$temp" == 0x"$nowtime" ]; then
+            for i in `cat $nicfilename`; do
+		if echo $i | grep -qv "hour"; then
+                    ${CMD_SUDO} ethtool $i | grep 'Link detected' | grep -qv 'yes'
+                    if [ $? -eq 0 ]; then
+                        pub_messageAppend "$i:Link is down." n
+                        pub_IdcFreeCreate "$i" "$i:Link is down." "n"
+                        otherstatus=$error
+                        pub_messageSend "NIC" "[ ERROR ]" "$i:Link is down."
+                    fi
+		fi
+            done
+            rm -f $nicfilename
+	fi
+    else
+        if cat $logmessages | grep -qi 'Link is down'; then
+            echo "hour_time:"$(date -d '6 hour' '+%H') > $nicfilename
+            cat $logmessages | grep -i 'Link is down' | awk -F":" '{print $NF}' | awk -F" " '{print $1}' >> $nicfilename
+        fi
+    fi
+
+    # 检查Memory or FBD configuration CRC read error错误
+    local pri_mem_log
+    cat $logmessages 2>/dev/null | grep -q "Memory or FBD configuration CRC read error"
+    if [ $? -eq 0 ]; then
+        # memstatus=$warning
+        pri_mem_log=$(cat $logmessages 2>/dev/null | grep "Memory or FBD configuration CRC read error" | tail -1)
+        pub_messageAppend "Memory or FBD configuration CRC read error!" 2
+        # pub_IdcFreeCreate "unknown" "$pri_mem_log" "2"
+        pub_messageSend "mem" "[ WARNING ]" "$pri_mem_log"
+    fi
+
+    # FIO error
+    local pri_fio_log
+    #by luxue
+    local fio_err=0
+    cat $logmessages 2>/dev/null | grep -q "fioerr Fusion-io"
+    if [ $? -eq 0 ]; then
+        #by luxue
+        cat $logmessages 2>/dev/null | grep "fioerr Fusion-io" | grep "channel already locked"
+        if [ $? -eq 0 ]; then
+            fio_err=0
+        else
+            fio_err=1
+        fi
+        if [ $fio_err -eq 1 ]; then
+            status=$error
+            cat $logmessages 2>/dev/null | grep "fioerr Fusion-io" | grep "Unhandled ioctl:"
+            if [ $? -eq 0 ]; then
+                pri_fio_log=$(cat $logmessages 2>/dev/null | grep "fioerr Fusion-io" |grep "Unhandled ioctl:"| tail -1)
+                pub_messageAppend "Fusion-io Card error detected." p
+                pub_IdcFreeCreate "fio" "$pri_fio_log.Please PE to do software configuration,if success,close the problem." "p"
+                otherstatus=$error
+                pub_messageSend "fio" "[ ERROR ]" "$pri_fio_log"
+            else
+                pri_fio_log=$(cat $logmessages 2>/dev/null | grep "fioerr Fusion-io" | tail -1)
+                pub_messageAppend "Fusion-io Card error detected." p
+                pub_IdcFreeCreate "fio" "$pri_fio_log" "p"
+                otherstatus=$error
+                pub_messageSend "fio" "[ ERROR ]" "$pri_fio_log"
+            fi
+        fi
+    fi
+
+    # 如果一台机子上EDAC和mcelog都打开记录，那么"EDAC MC"的条目和"Machine check events logged"条目中
+    # 在机子大量发生CE错误时会至少有一个大量报错。事实上，按照当前ali_kernel的代码逻辑，EDAC打开时，
+    # mcelog是不会打印Machine check events的。（实际上观测到一些漏网之鱼，但是不知道是怎么来的）
+    # 因此我们的检查逻辑如下：如果EDAC达到阈值（每小时3000条）或者mcelog达到阈值（每小时40条）
+    # 则向idcfree报修. EDAC报修逻辑已经在前面了
+
+    # 检查MCE log
+    local pri_mce_line=$(cat $logmessages 2>/dev/null | grep "Machine check events logged$" | wc -l)
+    # 每小时超过20条Machine check events logged信息则去检查mcelog
+    if [ "$pri_mce_line" -gt 40 ] || [ x"$IS_HWQC" = "x1" -a "$pri_mce_line" -gt 10 ]; then
+        pub_mce_threshold_reached="yes"
+        if echo "$pub_vendor" | grep -vqiE "Huawei|Inventec|Inspur"; then
+            pub_messageSend "mem" "[ ERROR ]" "mcelog errors detected."
+            pub_messageAppend "mcelog errors detected." 2
+            if ! pub_mcelog_Dell_OB; then
+                pub_IdcFreeCreate "mcelog" "mcelog errors detected, login to winoob or check /var/log/mcelog to get accurate DIMM" "2"
+                memstatus=$error
+            fi
+        fi
+    else
+	total_mce_lines=`cat /var/log/messages 2>/dev/null | grep "Machine check events logged$" | wc -l`
+        if [ "$total_mce_lines" -gt 1000 ]; then
+            pub_mce_threshold_reached="yes"
+            if echo "$pub_vendor" | grep -vqiE "Huawei|Inventec|Inspur"; then
+                pub_messageSend "mem" "[ ERROR ]" "mcelog errors detected."
+                pub_messageAppend "mcelog errors detected." 2
+                if ! pub_mcelog_Dell_OB; then
+                    pub_IdcFreeCreate "mcelog" "mcelog errors detected, login to winoob or check /var/log/mcelog to get accurate DIMM" "2"
+                    memstatus=$error
+                fi
+            fi
+	fi   
+    fi
+
+    # 华为单独拎出来
+    if echo "$pub_vendor" | grep -qi "Huawei" && [ "$pub_mce_threshold_reached" = "yes" ]; then
+        pub_check_mcelog_huawei
+    fi
+
+    # 华佗及其他应用要求不运行硬件监控自有的磁盘检查逻辑
+    #if pub_has_huatuo; then
+    #    ${CMD_SUDO} mv -f $msg_current $msg_baselog
+    #    rm -f $msg_increment $logmessages &>/dev/null
+    #    return
+    #fi
+
+    #下面一系列代码是为了发现messages中报告的磁盘Medium Error以及I/O Error
+
+    cat $logmessages 2>/dev/null | grep -q "Medium Error" &>/dev/null
+    if [ $? -eq 0 ]; then
+        # Sep 15 07:59:39 host kernel: sdk: Current: sense key: Medium Error
+        for pri_disk in $(cat $logmessages 2>/dev/null | grep "Medium Error" | awk -F"kernel:" '{print $2}' | awk -F: '{print $1}' | grep -owE "(sd[a-z]|cciss/c[0-9]d[0-9])" | sort -u | grep -vE "^$"); do
+            [ -z "$(echo $pri_disk|grep -E '^sd|^cciss|^ssd')" ] && continue
+            [ "$pri_disk" == "sd" ] && continue
+            pub_messages_errordisk $pri_disk "Medium Error" # && pub_aliyun_umountDir /dev/${pri_disk}1
+        done
+
+        # Sep 15 08:29:00 host kernel: [2143814.668545] sd 0:0:4:0: [sde] Sense Key : Medium Error [current]
+        for pri_disk in $(cat $logmessages 2>/dev/null | grep "Medium Error" | awk -F"kernel:" '{print $2}' | grep -oE "\[(sd[a-z]|cciss/c[0-9]d[0-9])\]" | sed 's/\[//;s/\]//' | sort -u); do
+            [ -z "$(echo $pri_disk|grep -E '^sd|^cciss|^ssd')" ] && continue
+            [ "$pri_disk" == "sd" ] && continue
+            pub_messages_errordisk $pri_disk "Medium Error" # && pub_aliyun_umountDir /dev/${pri_disk}1
+        done
+        filesystem_disk_error="YES"
+    fi
+
+    # Dec 10 15:11:40 host kernel: [23912581.404401] sd 2:0:0:2: [sdb] Add. Sense: Unrecovered read error
+    cat $logmessages 2>/dev/null | grep -q "Unrecovered read error" &>/dev/null
+    if [ $? -eq 0 ]; then
+        for pri_disk in $(cat $logmessages 2>/dev/null | grep "Unrecovered read error" | awk -F"kernel:" '{print $2}' | grep -oE "\[(sd[a-z]|cciss/c[0-9]d[0-9])\]" | sed 's/\[//;s/\]//' | sort -u); do
+            [ -z "$(echo $pri_disk|grep -E '^sd|^cciss|^ssd')" ] && continue
+            [ "$pri_disk" == "sd" ] && continue
+            pub_messages_errordisk $pri_disk "Unrecovered read error" # && pub_aliyun_umountDir /dev/${pri_disk}1
+        done
+        filesystem_disk_error="YES"
+    fi
+
+    # Sep 15 07:32:11 host kernel: : end_request: I/O error, dev sdn, sector 149241663
+    cat $logmessages 2>/dev/null | grep -q "end_request: I/O error" &>/dev/null
+    if [ $? -eq 0 ]; then
+        for pri_disk in $(cat $logmessages 2>/dev/null | grep "end_request: I/O error" | awk -F, '{print $2}' | awk '{print $2}' | grep -E "sd|ssd|cciss" | sort -u); do
+            echo $pri_disk | grep -qE "nbd|drbd|fio|md|tapdev|dm" && continue
+            pub_messages_errordisk $pri_disk "end_request: I/O error" # && pub_aliyun_umountDir /dev/${pri_disk}1
+        done
+        filesystem_disk_error="YES"
+    elif cat $logmessages 2>/dev/null | grep -q "end_request.*error"; then
+        for pri_disk in $(cat $logmessages 2>/dev/null | grep "end_request.*error" | awk -F, '{print $2}' | awk '{print $2}' | grep -E "sd|ssd|cciss" | sort -u); do
+            echo $pri_disk | grep -qE "nbd|drbd|fio|md|tapdev|dm" && continue
+            pub_messages_errordisk $pri_disk "end_request error" # && pub_aliyun_umountDir /dev/${pri_disk}1
+        done
+        filesystem_disk_error="YES"
+    fi
+
+    # Sep 14 11:42:22 host kernel: : [1706734.660015] Buffer I/O error on device sdc1, logical block 488144896
+    cat $logmessages 2>/dev/null | grep -q "Buffer I/O error" &>/dev/null
+    if [ $? -eq 0 ]; then
+        for pri_disk in $(cat $logmessages 2>/dev/null | grep "Buffer I/O error" | awk -F, '{print $1}' | awk '{print $NF}' | grep -E "sd|ssd|cciss" | sort -u); do
+            echo $pri_disk | grep -qE "nbd|drbd|fio|md|tapdev|dm" && continue
+            pub_messages_errordisk $pri_disk "Buffer I/O error" # && pub_aliyun_umountDir /dev/${pri_disk}1
+        done
+        filesystem_disk_error="YES"
+    fi
+
+    # if in RamOS, or scheduled by HWQC, don't check mounts
+    if [ x"$IS_RAMOS" = "xYES" ] || [ x"$IS_HWQC" = "x1" ]; then
+        ${CMD_SUDO} mv -f $msg_current $msg_baselog
+        rm -f $msg_increment $logmessages &>/dev/null
+        return
+    fi
+
+    #下面的一系列代码为了发现offline|dead|medium等情况的磁盘丢失
+    pri_root_dev=`cat /proc/mounts 2>/dev/null |egrep 2>/dev/null "ext3|ext4"|grep -w /boot |awk '{print $1}'|sed -e 's/[0-9]\|p[0-9]//g'`  #/所在磁盘
+    if [ -z "$pri_root_dev" ]; then
+        pri_root_dev="null"
+    fi
+    local pri_dev
+    local pri_dir
+    local pri_device
+    local pri_name
+    local pri_disk_log
+    local pri_label
+    local pri_label_dev
+    local pri_lnfs
+    for pri_dir in `cat /proc/mounts 2>/dev/null |egrep 2>/dev/null "ext3|ext4"|grep /dev|grep -vw /|grep -v ${pri_root_dev}|grep -vE '/dev/nbd|/dev/drbd|/dev/mapper/|/dev/loop|/dev/md|/dev/fio|/dev/nb'|awk '{print $2}'`; do # why using /proc/mounts because of mount -l may hanged due to xen app
+        pri_dev=`df -hlP $pri_dir|grep -v Filesystem|awk '{print $1}'|grep ^/dev/`  #得到磁盘如/dev/sdb
+        if echo "$pri_dev" | grep -qE "/c[0-9]d[0-9]$"; then
+            :
+        elif echo "$pri_dev" | grep -qE "/sd|/ssd"; then
+            pri_dev=`echo "$pri_dev"|sed -e 's/[0-9]\+$//g'`
+        else
+            pri_dev=`echo "$pri_dev"|sed -e 's/[0-9]\+$\|p[0-9]\+$//g'`
+        fi
+        if echo $pri_dev |grep -q "/dev/mapper"; then
+            continue
+        fi
+        if [ -d "$pri_dev" ] || [ -z "$pri_dev" ]; then
+            continue
+        fi
+
+        ${CMD_SUDO} ${CMD_BLOCKDEV} --setrw $pri_dev &>/dev/null
+        if [ $? -ne 0 ]; then   #磁盘设置RW失败的话
+            # pri_dev目前记录的还是从df和/proc/mounts上正常的设备
+            # pri_label_dev记录的是实际挂载到pri_label的设备
+            # 两者如果不同则有可能是发生了盘符漂移
+            # 报修的时候需要报告我们期望的正常设备名，将其保存为$pri_desired_dev
+            pri_desired_dev=$pri_dev
+
+            pri_label=`awk '$2=="'$pri_dir'" {print $0}' /etc/fstab 2>/dev/null|awk '{print $1}'|awk -F= '{print $2}'|sed 's/^\///'`
+            if [ -n "$pri_label" ]; then
+                if [ -d /dev/disk/by-label/ ]; then
+                    if ls -1 /dev/disk/by-label/ 2>/dev/null | grep -qw $pri_label; then
+                        pri_lnfs=$(ls -1 /dev/disk/by-label/ 2>/dev/null | grep -w $pri_label | head -1)
+                        pri_label_dev=$(readlink -f /dev/disk/by-label/$pri_lnfs)
+                    fi
+                fi
+                # TODO pri_label_dev 为空，则表示这个盘已经消失
+                [ -n "$pri_label_dev" ] && pri_dev="$pri_label_dev"
+            fi
+
+            # /dev/sda1 -> sda; /dev/cciss/c0d0p1 -> cciss/c0d0
+            pri_device=$(echo "$pri_dev" | sed -e 's/[0-9]\+$\|p[0-9]\+$//g' | sed -e 's/:$//')
+            pri_disk=$(echo "$pri_device" | sed -e 's/^\/dev\///')
+
+            # avoid duplication
+            if [ -z "$pub_error_disk" ]; then
+                pub_error_disk=$pri_disk
+            elif echo "$pub_error_disk" | grep -qw $pri_disk; then
+                continue
+            else
+                pub_error_disk="$pub_error_disk,$pri_disk"
+            fi
+
+            # TODO: Log Example ?
+            cat $logmessages 2>/dev/null | grep -B 1 "$pri_disk" | grep -qiE "offline|dead|medium" &>/dev/null
+            if [ $? -eq 0 ]; then
+                pri_disk_log=$(cat $logmessages 2>/dev/null | grep -B 1 "$pri_disk" | grep -iE "offline|dead|medium" | tail -1)
+            else
+                pri_disk_log=$(cat $logmessages 2>/dev/null | grep -iE "dead device" |tail -1)
+            fi
+            
+            # 正如前面所说，pri_device 和 pri_desired_dev 不一样的时候，
+            # 极有可能是发生了盘符漂移
+            if [ x"$pri_device" != x"$pri_desired_dev" ]; then
+                append_msg="blockdev setrw failed! was $pri_desired_dev, please umount $pri_desired_dev."
+            else
+                append_msg="blockdev setrw failed!"
+            fi
+
+            # input : pri_device
+            # output: pub_disk_string
+            #pub_check_slot "$pri_device" "$append_msg"
+
+            diskstatus=$error
+            pub_messageAppend "$pri_device $append_msg" 1
+            pub_messageSend "storage" "[ ERROR ]" "$pri_device $append_msg"
+            [ -e ${pub_chkhw_logdir}/raidcard ] && grep -q "raidcard" ${pub_chkhw_logdir}/raidcard && continue
+            pub_errorSlot="`echo $pub_slot | cut -d, -f1`"
+            #if [ -z "$pri_disk_log" ]; then
+            #    pub_IdcFreeCreate "$pri_desired_dev" "$pub_disk_string" "1" "$pub_disk_raw"
+            #else
+            #    error_msg="$pub_disk_string | Log: $pri_disk_log"
+            #    pub_IdcFreeCreate "$pri_desired_dev" "$error_msg" "1" "$pub_disk_raw"
+            #fi
+            pub_disk_raw=""
+            pub_errorSlot=""
+        fi
+    done
+
+    #检查/etc/fstab中是否存在未挂载的磁盘分区
+    for pri_dir in `cat /etc/fstab 2>/dev/null|sed 's/#.*$//g'|awk '$3=="ext3"||$3=="ext4"'|awk '{print $2}'|sort -u`; do
+        [ "$pri_dir" == "/" ] || pri_dir=`echo "$pri_dir"|sed 's/\/$//'`
+        cat /proc/mounts 2>/dev/null | awk '$2=="'$pri_dir'"' | grep -q .
+        if [ $? -ne 0 ]; then
+            #diskstatus=$warning
+            pub_messageAppend "$pri_dir in /etc/fstab not mounted!" 1
+            pub_messageSend "storage" "[ WARNING ]" "$pri_dir in /etc/fstab not mounted!"
+            [ -e ${pub_chkhw_logdir}/raidcard ] && grep -q "raidcard" ${pub_chkhw_logdir}/raidcard && continue
+            # pub_IdcFreeQuery && pub_IdcFreeCreate "$pri_dir" "$pri_dir in /etc/fstab not mounted!" "1"
+        fi
+    done
+
+    ${CMD_SUDO} mv -f $msg_current $msg_baselog
+    rm -f $msg_increment $logmessages &>/dev/null
+}
+
+function pub_check_ipmitool() {
+    if [ ! -x ${CMD_IPMITOOL} ]; then
+        err_msg="pub_check_ipmitool need ipmitool package."
+        pub_messageSend "debug" "[ DEBUG ]" "$err_msg"
+        return $debug
+    fi
+    if ps ax 2>/dev/null|awk '$3~/D/'|grep modprobe|grep -q ipmi; then
+        err_msg="OpenIPMI service hang!"
+        pub_messageSend "debug" "[ DEBUG ]" "$err_msg"
+        pub_IdcFreeCreate "unknown" "BMC not responding, maybe firmware update required." "7"
+        otherstatus=$error
+        return $debug
+    else
+        pub_ipmitool_timeout
+        if [ $? -eq 127 ]; then
+            pub_messageAppend "ipmitool timeout, maybe firmware update required." 7
+            pub_messageSend "debug" "[ CRITICAL ]" "ipmitool timeout, maybe firmware update required."
+            #pub_IdcFreeCreate "unknown" "ipmitool timeout, maybe firmware update required" "7"
+            exitstatus=$critical
+            return $exitstatus
+        fi
+    fi
+    if ! ${CMD_SERVICE} ipmi status &>/dev/null; then
+        ${CMD_SUDO} ${CMD_SERVICE} ipmi start &>/dev/null &
+        sleep 3
+    fi
+   
+    #华为英业达部分机器检查电源功耗，防止误报
+    #local pri_power_idcfree=0
+    #local ipmitoolfile="/dev/shm/ipmitool_file"
+    #if [ pub_is_inv_part -o pub_is_huawei_part -o pub_is_hp_part ] && [ pub_is_single_psu -o pub_has_only_one_psu ]; then
+    #if ! pub_is_single_psu && ! pub_has_only_one_psu; then
+    #	if pub_is_inv_part || pub_is_huawei_part || pub_is_hp_part; then
+    #        psu1power=`${CMD_SUDO} ${CMD_IPMITOOL} sdr elist | grep -Ew "460P1_Out_Power|PSU1_Out_Power|Power1|Power Supply 1" | awk -F"|" '{printf $NF}' | awk -F" " '{printf $1}'`
+    #        psu2power=`${CMD_SUDO} ${CMD_IPMITOOL} sdr elist | grep -Ew "460P2_Out_Power|PSU2_Out_Power|Power2|Power Supply 2" | awk -F"|" '{printf $NF}' | awk -F" " '{printf $1}'`
+    #        if [ -z "$psu1power" ] && [ -z "$psu2power" ]; then
+    #            psu1power=50
+    #            psu2power=50
+    #        fi
+    #        if [ x"$psu1power" != "xNo" -a x"$psu2power" != "xNo" ]; then
+    #            psupower=`echo "$psu1power $psu2power 0.2" | awk '{print ($1+$2)*$3}'`
+    #            if [ $(echo "$psu1power <= $psupower" | bc) -eq 1 ]; then
+    #                pwrstatus=$error
+    #                pri_power_idcfree=1
+    #                pub_messageSend "psu1" "[ ERROR ]" "psu1 power is too low."
+    #                pub_messageAppend "Power Supply1 lost or failure detected!" 3
+    #                pub_IdcFreeCreate "PSU 1" "PSU1 power is too low,the value is $psu1power." "3"
+    #            fi
+    #            if [ $(echo "$psu2power <= $psupower" | bc) -eq 1 ]; then
+    #                pwrstatus=$error
+    #    	    pri_power_idcfree=1
+    #               pub_messageSend "psu2" "[ ERROR ]" "psu2 power is too low."
+    #               pub_messageAppend "Power Supply2 lost or failure detected!" 3
+    #                pub_IdcFreeCreate "PSU 2" "PSU2 power is too low,the value is $psu2power." "3"
+    #            fi
+    #        else
+    #            if [ ! -e $ipmitoolfile ]; then
+    #                touch $ipmitoolfile
+    #            fi
+    #            ipmitool_reset_count=`cat $ipmitoolfile | wc -l `
+    #            if [ $ipmitool_reset_count -le 3 ]; then
+    #                ${CMD_SUDO} ${CMD_IPMITOOL} mc reset cold
+    #                if [ $? -eq 0 ]; then
+    #                    echo "ipmitool mc reset cold" >> $ipmitoolfile
+    #                fi
+    #            else
+    #                if [ x"$psu1power" = "xNo" ]; then
+    #                    pri_power_idcfree=1
+    #                    pub_messageSend "psu1" "[ ERROR ]" "psu1 power is no reading."
+    #                    pub_messageAppend "Power 1 is no reading." 3
+    #                    pub_IdcFreeCreate "PSU 1" "PSU1 power is no reading." "3"
+    #                fi
+    #                if [ x"$psu2power" = "xNo" ]; then
+    #                    pri_power_idcfree=1
+    #                    pub_messageSend "psu2" "[ ERROR ]" "psu2 power is no reading."
+    #                    pub_messageAppend "Power 2 is no reading." 3
+    #			pub_IdcFreeCreate "PSU 2" "PSU2 power is no reading." "3"
+    #                fi
+                    #rm -f $ipmitoolfile
+    #            fi
+    #       fi	
+    #    fi
+    #fi
+    # get the increment of SEL log
+    local sel_baselog="${pub_chkhw_logdir}/basemclog"
+    local sel_current="/dev/shm/sel_current.log.$suf"
+    local sel_increment="/dev/shm/sel_increment.log.$suf"
+    local sellog_bin="/home/hwnoc/sellog_bin.$currtime"
+    local sellog_txt="/home/hwnoc/sellog_txt"
+    #local pri_date="$(date -d '-1 month' +%m)/[0-9]+/$(date -d '-1 month' +%Y)|$(date +%m)/[0-9]+/$(date +%Y)"
+    local pri_date="`date -d '2 day ago' +%m/%d/%Y ` | `date -d '1 day ago' +%m/%d/%Y` | `date -d 'today' +%m/%d/%Y`"
+    echo $pub_vendor | grep -qi "Sugon" && pri_date="" # Sugon 经常是Pri-Init Time-stamp, 不检查日期
+    local pri_check_lines=""
+
+    test -e $sel_baselog || ${CMD_SUDO} ${CMD_TOUCH} $sel_baselog 2>/dev/null
+
+    # 检查BMC是否hang住
+    #${CMD_SUDO} ${CMD_IPMITOOL} raw 6 1 2>/dev/null
+    #if [ $? -ne 0 ]; then
+    #    pub_IdcFreeCreate "BMC hang" "BMC hang. Need to use tool to repair BMC. If failed, need to replace." "1" #报修
+    #fi
+
+    # 取当前日志到文件sel_current
+    ${CMD_SUDO} ${CMD_IPMITOOL} sel elist > $sel_current 2>/dev/null
+    #if [ $? -ne 0 ]; then
+    #    ${CMD_SUDO} ${CMD_IPMITOOL} sel elist
+    #    if [ $? -ne 0 ]; then
+    #        pub_IdcFreeCreate "BMC hang" "BMC hang. Need to use tool to repair BMC. If failed, need to replace." "1" #报修
+    #    fi
+    #fi
+    test -e $sel_current && diff $sel_baselog $sel_current|grep '^>'|sed 's/^>//g' > $sel_increment 2>/dev/null
+    #检查sel log中有满的情况，有关键字Log full.
+    cat $sel_current | grep -qi "Log full"
+    if [ $? -eq 0 ]; then
+        ${CMD_SUDO} ${CMD_IPMITOOL} sel writeraw $sellog_bin >> $sellog_txt 2>/dev/null
+        if [ $? -eq 0 ]; then
+            ${CMD_SUDO} ${CMD_IPMITOOL} sel clear
+        fi
+    fi
+
+    if [ -z "$(cat $sel_increment 2>/dev/null)" ]; then
+        rm -f $sel_increment &>/dev/null
+        return
+    fi
+
+    # logging BMC log to syslog, for later analysis
+    if [ x"$IS_RAMOS" != "xYES" ] && [ x"$IS_HWQC" != "x1" ]; then
+        while read line; do
+            ${CMD_SUDO} logger -p daemon.info -t HWBMC "$line"
+        done < "$sel_increment"
+    fi
+    
+    # 内存检查
+    #  1e4 | 01/02/2014 | 16:05:21 | Memory #0x4e | Configuration Error | Asserted
+    pri_check_lines=$(cat $sel_increment 2>/dev/null | grep -E "$pri_date" | grep "Memory" | grep "Configuration Error" | grep "Asserted")
+    if [ -n "$pri_check_lines" ]; then
+        pub_check_mcelog_huawei "config_err"
+    fi
+
+    pri_quanta_log="/dev/shm/quanta.log"
+    pri_check_lines=$(cat $sel_increment 2>/dev/null | grep -E "$pri_date" | grep "Memory" | grep "logging limit reached" | grep "Asserted")
+    if [ -n "$pri_check_lines" ]; then
+        if echo $pub_vendor | tr [a-z] [A-Z] | grep -q "QUANTA"; then
+            echo $pub_vendor > $pri_quanta_log
+            pub_check_quanta_slot "$pri_quanta_log" "logging limit reached"
+        fi
+    fi
+
+    [[ -e $pri_quanta_log ]] && rm -f $pri_quanta_log
+
+    # Dell Memory Error:
+    #     5 | 02/03/2014 | 10:18:27 | Memory Mem ECC Warning | Transition to Critical from less severe
+    #by luxue
+    pri_check_lines=$(cat $sel_increment 2>/dev/null | grep -E "$pri_date" | grep "Memory" | grep -E "Transition to Critical") 
+    if [ -n "$pri_check_lines" ]; then
+        memstatus=$critical
+        #errordisk=$(echo "$pri_check_lines" | tail -1 | awk -F"| Memory " '{ print $2 }' | awk -F\| '{ print $1 }' | sed -e 's/^\s\+//;s/\s\+$//')
+        pri_check_record=`echo $pri_check_lines| tail -1 | awk -F"|" '{print $1}'`
+        pub_check_dell_slot "$pri_check_record" "$pri_check_lines" "Mem ECC Warning"
+        #pub_messageSend "mem" "[ CRITICAL ]" "$pri_check_lines"
+        #pub_messageAppend "System state comes to Critical due to Mem ECC warning limit reached." 2
+        #pub_IdcFreeCreate "$errordisk" "$pri_check_lines" "2"
+    fi
+
+    # Uncorrectable ECC
+    # Correctable ECC
+    # 策略: Inventec和Inspur通过SEL log来判断槽位
+    #       HP/IBM:
+    #       1 | 02/08/2014 | 08:18:32 | Memory #0x3f | Correctable ECC logging limit reached | Asserted
+    local pri_total_ecc_date="`date -d '9 day ago' +%m/%d/%Y ` | `date -d '8 day ago' +%m/%d/%Y ` | `date -d '7 day ago' +%m/%d/%Y ` | `date -d '6 day ago' +%m/%d/%Y ` | `date -d '5 day ago' +%m/%d/%Y ` | `date -d '4 day ago' +%m/%d/%Y ` | `date -d '3 day ago' +%m/%d/%Y ` | `date -d '2 day ago' +%m/%d/%Y ` | `date -d '1 day ago' +%m/%d/%Y` | `date -d 'today' +%m/%d/%Y`"
+    echo $pub_vendor | grep -qi "Sugon" && pri_total_ecc_date="" # Sugon 经常是Pri-Init Time-stamp, 不检查日期
+
+    pri_check_lines=$(cat $sel_increment 2>/dev/null | grep -E "$pri_date" | grep "Memory" | grep -E "Correctable|Uncorrectable" | grep "Asserted")
+    total_sel_ecc_lines=`cat $sel_current 2>/dev/null | grep -E "$pri_total_ecc_date" | grep "Memory" | grep -E "Correctable|Uncorrectable" | grep "Asserted" | wc -l`
+    if [ -n "$pri_check_lines" ]; then
+        echo "$pri_check_lines" | tail -n 10 > "$pub_sel_mem_tmp"
+        echo "$pri_check_lines" | grep -q "Uncorrectable" && pub_mce_threshold_reached="yes"
+        err_lines=`echo "$pri_check_lines" | grep "Correctable" | wc -l`
+        # ECS hosts needs more strict threshold.
+	total_ecc_threshold=50
+        inspur_total_ecc_threshold=10
+        if pub_is_ecs_host; then
+            hw_threshold=1
+            in_threshold=10
+            inspur_threshold=2
+	    other_threshold=10
+        elif [ x"$IS_HWQC" = "x1" ]; then
+            hw_threshold=1
+            in_threshold=1
+            inspur_threshold=1
+	    other_threshold=1
+        else
+            hw_threshold=1
+            in_threshold=20
+            inspur_threshold=2
+	    other_threshold=10
+        fi
+        vendor=`echo $pub_vendor | tr [a-z] [A-Z]`
+        case "$vendor" in
+            *INSPUR*)
+                if echo $pub_model | grep -qEw "SA5248L|NF5288|NF5588M3|SN3116M4-10G-SH"; then
+                    [[ $err_lines -ge $other_threshold ]] && pub_mce_threshold_reached="yes"
+                else
+                    [[ $err_lines -ge $inspur_threshold ]] && pub_mce_threshold_reached="yes"
+		fi
+		if [ x"$pub_mce_threshold_reached" != "xyes" ]; then
+		    [[ $total_sel_ecc_lines -ge $inspur_total_ecc_threshold ]] && pub_mce_threshold_reached="yes"
+		fi
+                pub_check_mcelog_inspur
+                ;;
+            *INVENTEC*)
+                if [ $err_lines -ge $in_threshold ]; then
+		    pub_mce_threshold_reached="yes"
+		elif [ $total_sel_ecc_lines -ge $total_ecc_threshold ]; then
+		    pub_mce_threshold_reached="yes"
+		fi
+                if echo $pub_model | grep -qE "K900G3-10G|K800G3-10G|A900G3-10G"; then
+                    [[ $err_lines -ge $inspur_threshold ]] && pub_mce_threshold_reached="yes"
+                fi
+                pub_check_mcelog_inventec
+                ;;
+            *HUAWEI*)
+		if [ $err_lines -ge $hw_threshold ]; then
+                    pub_mce_threshold_reached="yes"
+		elif [ $total_sel_ecc_lines -ge $total_ecc_threshold ]; then
+		    pub_mce_threshold_reached="yes"
+		fi
+                pub_check_mcelog_huawei
+                ;;
+	    *LENOVO*)
+		if [ $err_lines -ge $other_threshold ]; then
+                    pub_mce_threshold_reached="yes"
+                elif [ $total_sel_ecc_lines -ge $total_ecc_threshold ]; then
+                    pub_mce_threshold_reached="yes"
+                fi
+		if echo $pub_model | grep -qE "RD452X|SD350X"; then
+                    [[ $err_lines -ge $inspur_threshold ]] && pub_mce_threshold_reached="yes"
+                elif echo $pub_model | grep -qE "SD340X|RD642X"; then
+                    [[ $err_lines -ge $hw_threshold ]] && pub_mce_threshold_reached="yes"
+                fi
+		pub_check_mcelog_lenovo
+                ;;
+            *IBM*|*HP*|*DELL*)
+                pub_check_mcelog_hp_ibm_dell
+                ;;
+            *)
+                #FIXME: 其他机型暂定和Inventec/Inspur相同
+		if [ $err_lines -ge $other_threshold ]; then
+		    pub_mce_threshold_reached="yes"
+		elif [ $total_sel_ecc_lines -ge $total_ecc_threshold ]; then
+		    pub_mce_threshold_reached="yes"
+		fi
+                if echo $vendor | grep -q 'QUANTA' && echo $pub_model | grep -qE 'S2BA|S2SA'; then
+                    [[ $err_lines -ge $inspur_threshold ]] && pub_mce_threshold_reached="yes"
+                    if [ x"$pub_mce_threshold_reached" != "xyes" ]; then
+                        [[ $total_sel_ecc_lines -ge $inspur_total_ecc_threshold ]] && pub_mce_threshold_reached="yes"
+                    fi 
+                fi
+                pub_check_mcelog_ipmi
+                ;;
+        esac
+        pub_mce_threshold_reached="no"
+        rm -f "$pub_sel_mem_tmp"
+    fi
+
+    # 电压过低
+    # TODO: 暂时不报
+    #cat $sel_increment 2>/dev/null|grep Voltage|grep -E "Critical|Non-recoverable"|grep -E "$pri_date" &>/dev/null
+    #if [ $? -eq 0 ]; then
+    #    # pwrstatus=$warning
+    #    # pri_power_idcfree=1
+    #    pri_power_log=$(cat $sel_increment 2>/dev/null|grep Voltage|grep -E "Critical|Non-recoverable"|grep -E "$pri_date"|tail -1)
+    #    pub_messageSend "power" "[ WARNING ]" "$pri_power_log"
+    #    pub_messageAppend "BIOS Battery Voltage is low." 3
+    #    # pub_IdcFreeCreate "unknown" "$pri_power_log" "3"
+    #fi
+
+    #检查风扇故障
+    # TODO: examples?
+    # ac | 12/27/2013 | 03:51:53 | Fan PS 1 Fan Fault | State Asserted
+    pri_check_lines=$(cat $sel_increment 2>/dev/null | grep -E "$pri_date" | grep "Fan" | grep -E "Critical|Non-recoverable|Fan Fault" | grep "Asserted")
+    if [ -n "$pri_check_lines" ]; then
+        pwrstatus=$error
+        errordisk=$(echo "$pri_check_lines" | tail -1 | awk -F\| '{ print $4 }' | sed -e 's/^\s\+//;s/\s\+$//')
+        #fansensor=`echo $errordisk | awk -F"0x" '{print $NF}' | tr [a-z] [A-Z]`
+        pub_messageSend "power" "[ ERROR ]" "$pri_check_lines"
+        pub_messageAppend "$pri_check_lines" "f"
+        #pub_IdcFreeCreate "$errordisk" "$pri_check_lines" "f"
+        pub_check_fan_slot "$errordisk" "$pri_check_lines"
+    fi
+
+    #   40 | 11/08/2013 | 07:10:19 | Fan #0x0a | Transition to Off Line
+    #    3 | 01/20/2014 | 09:16:13 | Fan #0x09 | Transition to Degraded
+    pri_check_lines=$(cat $sel_increment 2>/dev/null | grep -E "$pri_date" | grep "Fan" | grep -E "Transition to Degraded|Transition to Off Line")
+    if [ -n "$pri_check_lines" ]; then
+        pwrstatus=$error
+        errordisk=$(echo "$pri_check_lines" | tail -1 | awk -F\| '{ print $4 }' | sed -e 's/^\s\+//;s/\s\+$//')
+        pub_messageSend "power" "[ ERROR ]" "$pri_check_lines"
+        pub_messageAppend "$pri_check_lines" "f"
+        #pub_IdcFreeCreate "$errordisk" "$pri_check_lines" "f"
+        pub_check_fan_slot "$errordisk" "$pri_check_lines"
+    fi
+
+    # if scheduled by HWQC, don't check power lost
+    if [ x"$IS_HWQC" = "x1" ]; then
+        ${CMD_SUDO} mv -f $sel_current $sel_baselog
+        return
+    fi
+
+    # more strict time period (1 hour)
+    pri_date="`date -d '1 hour ago' '+%m/%d/%Y \| %H'`|`date '+%m/%d/%Y \| %H'`"
+    echo $pub_vendor | grep -qi "Sugon" && pri_date=""
+
+    #检查电源故障
+    #     9 | 01/27/2014 | 15:40:01 | Power Supply #0x04 | Failure detected | Asserted
+    # FIXME: Logic might be incorrect
+    local pri_log_line
+    local pri_power_idcfree=0
+    local psu_diskinfo=""
+    pri_check_lines=$(cat $sel_increment 2>/dev/null | grep -E "$pri_date" | grep -E "Power Supply|Power Unit|PS" | grep -E "input lost|Failure detected|Fault" | grep "Asserted")
+    if [ -n "$pri_check_lines" -a $pri_power_idcfree -eq 0 ]; then
+        pri_log_line=$(echo "${pri_check_lines//\//\\/}" | tail -1)
+        pri_power_idcfree=1
+        if echo "$pri_log_line" | grep -q "lost"; then
+            cat $sel_increment 2>/dev/null | sed -n "/$pri_log_line/,$"p | grep -E "Power Supply|Power Unit" | grep -E "input lost" | grep -q "Deasserted" && pri_power_idcfree=0
+            #cat $sel_increment 2>/dev/null | sed -n "/$pri_log_line/,$"p | grep -E "Power Supply|Power Unit" | grep -E "AC lost" | grep -q "Deasserted" && pri_power_idcfree=0
+        else
+            cat $sel_increment 2>/dev/null | sed -n "/$pri_log_line/,$"p | grep -E "Power Supply|Power Unit" | grep -E "Failure detected" | grep -q "Deasserted" && pri_power_idcfree=0
+        fi
+        cat $sel_increment 2>/dev/null | sed -n "/$pri_log_line/,$"p | grep -q "Fully Redundant" && pri_power_idcfree=0
+        if [ $pri_power_idcfree -eq 1 ]; then
+            vendor=`echo $pub_vendor | tr [a-z] [A-Z]`
+            errordisk=$(echo "$pri_log_line" | awk -F\| '{ print $4 }'|sed 's/Fan Fault//g' | sed 's/Fan//g' | sed -e 's/^\s\+//;s/\s\+$//')
+            pwrstatus=$error
+            case "$vendor" in
+                *HUAWEI*)
+                    sensor=`echo $errordisk | awk -F"#0x" '{print $NF}' | tr [a-z] [A-Z]`
+                    psu_diskinfo=`${CMD_SUDO} ${CMD_IPMITOOL} sdr elist | grep "$sensor"h | awk -F"|" '{print $1}' | awk -F" " '{print $1}'`
+                    ;;
+                *SUGON*)
+                    echo $errordisk 2>/dev/null | grep "Power Supply"
+                    if [ $? -eq 0 ]; then
+                        psu_diskinfo=$errordisk
+                    else
+                        psu_diskinfo=$(echo "$pri_log_line" | awk -F\| '{ print $3 }' | sed -e 's/^\s\+//;s/\s\+$//')
+                    fi                  
+                    ;;
+                *DELL*)
+                    pub_check_dell_psu "$pri_log_line" "$errordisk"
+                    ;;
+                *INSPUR*)
+                    echo $pub_vendor | grep -qE "SA5212H2|NF5270M3"
+                    if [ $? -eq 0 ]; then
+                        echo $errordisk | grep -q "0x66"
+                        if [ $? -eq 0 ]; then
+                            psu_diskinfo="PSU 1"
+                        fi
+                        echo $errordisk | grep -q "0x67"
+                        if [ $? -eq 0 ]; then
+                            psu_diskinfo="PSU 2"
+                        fi
+                    fi 
+                    ;;
+                *INVENTEC*)
+                    echo $errordisk 2>/dev/null | grep "0x31"
+                    if [ $? -eq 0 ]; then
+                        psu_diskinfo="PSU 1"
+                    fi
+                    echo $errordisk 2>/dev/null | grep "0x32"
+                    if [ $? -eq 0 ]; then
+                        psu_diskinfo="PSU 2"
+                    fi
+                    ;;
+                *)
+                    ;;
+            esac
+            if echo $vendor | grep -vq "DELL"; then
+                if [ -n "$psu_diskinfo" ]; then
+                    pub_messageSend "power" "[ ERROR ]" "$pri_check_lines"
+                    pub_messageAppend "Power Supply lost or failure detected!" 3
+                    pub_IdcFreeCreate "$psu_diskinfo" "$pri_check_lines" "3"
+                else
+                    pub_messageSend "power" "[ ERROR ]" "$pri_check_lines"
+                    pub_messageAppend "Power Supply lost or failure detected!" 3
+                    pub_IdcFreeCreate "$errordisk" "$pri_check_lines" "3"
+                fi
+            fi
+        fi
+    fi
+
+    #检查冗余丢失故障
+    #    26 | 12/29/2013 | 04:08:00 | Power Redundancy | Redundancy Lost
+    pri_log_line=""
+    if [ $pri_power_idcfree -eq 0 ]; then
+        pri_check_lines=$(cat $sel_increment 2>/dev/null | grep -E "$pri_date" | grep -E "Power Supply|Power Unit|PS" | grep "Redundancy Lost")
+        if [ -n "$pri_check_lines" ]; then
+            #if ! pub_is_huawei_part && ! pub_is_inv_part && ! pub_is_hp_part; then
+	    if ! pub_has_only_one_psu && ! pub_is_single_psu; then 
+		pri_log_line=$(echo "${pri_check_lines//\//\\/}" | tail -1)
+                if ! cat $sel_increment 2>/dev/null | sed -n "/$pri_log_line/,$"p | grep -q "Fully Redundant"; then
+                    pwrstatus=$error
+                    #by luxue
+                    errordisk=`cat $sel_increment | sed -n "1,/$pri_log_line/"p | grep "Power Supply" | grep "Status" | tail -1 | awk -F"|" '{print $4}' | sed 's/Status//g'| sed -e 's/^\s\+//;s/\s\+$//'`
+                    if [ -z "$errordisk" ]; then
+                        errordisk=$(echo $pri_log_line | awk -F\| '{ print $4 }' | sed -e 's/^\s\+//;s/\s\+$//')
+                    fi
+                    #errordisk=$(echo $pri_log_line | awk -F\| '{ print $4 }' | sed -e 's/^\s\+//;s/\s\+$//')
+                    pub_messageSend "power" "[ ERROR ]" "$pri_check_lines"
+                    pub_messageAppend "$pri_check_lines" 3
+                    pub_IdcFreeCreate "$errordisk" "$pri_check_lines" "3"
+                fi
+            fi
+        fi
+    fi
+
+# TODO: mask for now.
+#    # 检查CATERR
+#    # 130 | 09/13/2013 | 16:20:20 | Processor #0x0f | IERR | Asserted
+#    # 168 | 02/17/2014 | 16:44:18 | Processor CPU CAT Error | State Asserted
+    pri_check_lines=$(cat $sel_increment 2>/dev/null | grep -E "$pri_date" | grep "Processor" | grep -E "IERR|CAT Error" | grep "Asserted")
+    if [ -n "$pri_check_lines" ]; then
+        otherstatus=$error
+        pub_messageSend "sys" "[ ERROR ]" "$pri_check_lines"
+        pub_messageAppend "CAT Error occured." 4
+        #pub_IdcFreeCreate "CATErr" "CAT Error occured, maybe Memory, CPU or motherboard broken, check logs: $pri_check_lines" "s"
+	pub_IdcFreeCreate "CATErr" "Maybe CPU or motherboard error, check logs: $pri_check_lines.麻烦厂商给出FA report." "4"
+    fi
+
+    ${CMD_SUDO} mv -f $sel_current $sel_baselog
+}
+#by luxue
+#检查风扇槽位
+function pub_check_fan_slot(){
+    local fanslotinfo=$1
+    local fandiskinfo=$2
+    
+    vendor=`echo $pub_vendor | tr [a-z] [A-Z]`
+    fanslot=""
+    servermodel=`echo $pub_model | tr [a-z] [A-Z]` 
+    fansensor=`echo $fanslotinfo | awk -F"0x" '{print $NF}' | tr [a-z] [A-Z] | sed -e 's/^\s\+//;s/\s\+$//'`
+    case "$vendor" in
+        *DELL*)
+            case "$servermodel" in
+                *C6220*|*DCS6220*)
+                    [[ $fansensor == "D3" ]] && fanslot="FAN 1"
+                    [[ $fansensor == "D4" ]] && fanslot="FAN 2"
+                    [[ $fansensor == "D5" ]] && fanslot="FAN 3"
+                    [[ $fansensor == "D6" ]] && fanslot="FAN 4"
+                    ;;
+                *R510*)
+                    [[ $fansensor == "30" ]] && fanslot="FAN 1A"
+                    [[ $fansensor == "31" ]] && fanslot="FAN 1B"
+                    [[ $fansensor == "32" ]] && fanslot="FAN 2A"
+                    [[ $fansensor == "33" ]] && fanslot="FAN 2B"
+                    [[ $fansensor == "34" ]] && fanslot="FAN 3A"
+                    [[ $fansensor == "35" ]] && fanslot="FAN 3B"
+                    [[ $fansensor == "36" ]] && fanslot="FAN 4A"
+                    [[ $fansensor == "37" ]] && fanslot="FAN 4B"
+                    [[ $fansensor == "3A" ]] && fanslot="FAN 5A"
+                    [[ $fansensor == "3B" ]] && fanslot="FAN 5B"
+                    ;;
+                *R610*)
+                    [[ $fansensor == "30" ]] && fanslot="FAN 1A"
+                    [[ $fansensor == "31" ]] && fanslot="FAN 2A"
+                    [[ $fansensor == "32" ]] && fanslot="FAN 3A"
+                    [[ $fansensor == "33" ]] && fanslot="FAN 4A"
+                    [[ $fansensor == "34" ]] && fanslot="FAN 5A"
+                    [[ $fansensor == "35" ]] && fanslot="FAN 6A"
+                    [[ $fansensor == "36" ]] && fanslot="FAN 1B"
+                    [[ $fansensor == "37" ]] && fanslot="FAN 2B"
+                    [[ $fansensor == "38" ]] && fanslot="FAN 3B"
+                    [[ $fansensor == "39" ]] && fanslot="FAN 4B"
+                    [[ $fansensor == "3A" ]] && fanslot="FAN 5B"
+                    [[ $fansensor == "3B" ]] && fanslot="FAN 6B"
+                    ;;
+                *R620*)
+                    [[ $fansensor == "30" ]] && fanslot="FAN 1A"
+                    [[ $fansensor == "31" ]] && fanslot="FAN 1B"
+                    [[ $fansensor == "32" ]] && fanslot="FAN 2A"
+                    [[ $fansensor == "33" ]] && fanslot="FAN 2B"
+                    [[ $fansensor == "34" ]] && fanslot="FAN 3A"
+                    [[ $fansensor == "35" ]] && fanslot="FAN 3B"
+                    [[ $fansensor == "36" ]] && fanslot="FAN 4A"
+                    [[ $fansensor == "37" ]] && fanslot="FAN 4B"
+                    [[ $fansensor == "38" ]] && fanslot="FAN 5A"
+                    [[ $fansensor == "39" ]] && fanslot="FAN 5B"
+                    [[ $fansensor == "3A" ]] && fanslot="FAN 6A"
+                    [[ $fansensor == "3B" ]] && fanslot="FAN 6B"
+                    [[ $fansensor == "3C" ]] && fanslot="FAN 7A"
+                    [[ $fansensor == "3D" ]] && fanslot="FAN 7B"
+                    ;;
+                *R710*)
+                    [[ $fansensor == "30" ]] && fanslot="FAN 1"
+                    [[ $fansensor == "31" ]] && fanslot="FAN 2"
+                    [[ $fansensor == "32" ]] && fanslot="FAN 3"
+                    [[ $fansensor == "33" ]] && fanslot="FAN 4"
+                    ;;
+                *C6100*|*DCS6100*)
+                    [[ $fansensor == "01" ]] && fanslot="FAN 1"
+                    [[ $fansensor == "02" ]] && fanslot="FAN 2"
+                    [[ $fansensor == "03" ]] && fanslot="FAN 3"
+                    [[ $fansensor == "04" ]] && fanslot="FAN 4"
+                    ;;
+                *FS12-TY*|*C2100*)
+                    [[ $fansensor == "51" ]] && fanslot="System FAN 1"
+                    [[ $fansensor == "52" ]] && fanslot="System FAN 3"
+                    [[ $fansensor == "50" ]] && fanslot="PCI FAN"
+                    ;;
+                *R720XD*|*DCS2210*|*2950*|*R720*|*R910*)
+                    [[ $fansensor == "30" ]] && fanslot="FAN 1"
+                    [[ $fansensor == "31" ]] && fanslot="FAN 2"
+                    [[ $fansensor == "32" ]] && fanslot="FAN 3"
+                    [[ $fansensor == "33" ]] && fanslot="FAN 4"
+                    [[ $fansensor == "34" ]] && fanslot="FAN 5"
+                    [[ $fansensor == "35" ]] && fanslot="FAN 6"
+                    ;;
+                *1950*)
+                    [[ $fansensor == "30" ]] && fanslot="FAN 1A"
+                    [[ $fansensor == "31" ]] && fanslot="FAN 1B"
+                    [[ $fansensor == "32" ]] && fanslot="FAN 1C"
+                    [[ $fansensor == "33" ]] && fanslot="FAN 1D"
+                    [[ $fansensor == "34" ]] && fanslot="FAN 2A"
+                    [[ $fansensor == "35" ]] && fanslot="FAN 2B"
+                    [[ $fansensor == "36" ]] && fanslot="FAN 2C"
+                    [[ $fansensor == "37" ]] && fanslot="FAN 2D"
+                    [[ $fansensor == "38" ]] && fanslot="FAN 3A"
+                    [[ $fansensor == "39" ]] && fanslot="FAN 3B"
+                    [[ $fansensor == "3A" ]] && fanslot="FAN 3C"
+                    [[ $fansensor == "3B" ]] && fanslot="FAN 3D"
+                    [[ $fansensor == "3C" ]] && fanslot="FAN 4A"
+                    [[ $fansensor == "3D" ]] && fanslot="FAN 4B"
+                    [[ $fansensor == "3E" ]] && fanslot="FAN 4C"
+                    [[ $fansensor == "3F" ]] && fanslot="FAN 4D"
+                    ;;
+                *C5220*)
+                    [[ $fansensor == "68" ]] && fanslot="FAN 1"
+                    [[ $fansensor == "69" ]] && fanslot="FAN 2"
+                    [[ $fansensor == "6A" ]] && fanslot="FAN 3"
+                    [[ $fansensor == "6B" ]] && fanslot="FAN 4"
+                    [[ $fansensor == "6C" ]] && fanslot="FAN 5"
+                    [[ $fansensor == "6D" ]] && fanslot="FAN 6"
+                    [[ $fansensor == "6E" ]] && fanslot="FAN 7"
+                    [[ $fansensor == "6F" ]] && fanslot="FAN 8"
+                    ;;
+                *CS24-TY*)
+                    [[ $fansensor == "51" ]] && fanslot="FAN1_1"
+                    [[ $fansensor == "52" ]] && fanslot="FAN1_2"
+                    [[ $fansensor == "53" ]] && fanslot="FAN2_1"
+                    [[ $fansensor == "54" ]] && fanslot="FAN2_2"
+                    [[ $fansensor == "55" ]] && fanslot="FAN3_1"
+                    [[ $fansensor == "56" ]] && fanslot="FAN3_2"
+                    [[ $fansensor == "57" ]] && fanslot="FAN4_1"
+                    [[ $fansensor == "58" ]] && fanslot="FAN4_2"
+                    [[ $fansensor == "59" ]] && fanslot="FAN5_1"
+                    [[ $fansensor == "5A" ]] && fanslot="FAN5_2"
+                    [[ $fansensor == "50" ]] && fanslot="PCI FAN"
+                    ;;
+                *)
+                    ;;
+            esac
+            ;;
+        *INVENTEC*)
+            [[ $fansensor == "01" ]] && fanslot="SYS FAN 1"
+            [[ $fansensor == "02" ]] && fanslot="SYS FAN 2"
+            [[ $fansensor == "03" ]] && fanslot="SYS FAN 3"
+            [[ $fansensor == "04" ]] && fanslot="SYS FAN 4"
+            ;;
+        *INSPUR*)
+            case "$servermodel" in
+                *SA5212H2*)
+                    [[ $fansensor == "16" ]] && fanslot="FAN_CPU0"
+                    [[ $fansensor == "17" ]] && fanslot="FAN_CPU1"
+                    [[ $fansensor == "18" ]] && fanslot="FAN_SYS1"
+                    [[ $fansensor == "19" ]] && fanslot="FAN_SYS2"
+                    [[ $fansensor == "1A" ]] && fanslot="FAN_SYS3"
+                    [[ $fansensor == "1B" ]] && fanslot="FAN_SYS4"
+                    ;;
+                *NF5270M3*)
+                    [[ $fansensor == "17" ]] && fanslot="FAN 1"
+                    [[ $fansensor == "18" ]] && fanslot="FAN_CPU0"
+                    [[ $fansensor == "19" ]] && fanslot="FAN 2"
+                    ;;
+                *SA5248L*)
+                    [[ $fansensor == "41" ]] && fanslot="FAN 1"
+                    [[ $fansensor == "42" ]] && fanslot="FAN 2"
+                    ;;
+                *)
+                    ;;
+            esac
+            ;;
+        *)
+            ;;
+    esac
+    if [ -n "$fanslot" ]; then
+        pub_IdcFreeCreate "$fanslot" "$fandiskinfo" "f"
+    else
+        pub_IdcFreeCreate "$fanslotinfo" "$fandiskinfo" "f"
+    fi    
+}
+
+#by luxue
+#检查dell电源，定位槽位号
+function pub_check_dell_psu(){
+    local psu_sensor=""
+    local psu_record_len=""
+    local psu_sensorlow=""
+    local psu_sensorhign=""
+    local psusensor=""
+    local psuinfo=$1
+    local psudisk=$2
+    local dell_model=""
+    local psuslot=""
+
+    psu_sensor=$(echo "$psuinfo" | awk -F"|" '{ print $1 }' | sed -e 's/^\s\+//;s/\s\+$//')
+    
+    psu_record_len=`echo -n $psu_sensor | wc -c`
+    case $psu_record_len in 
+        1)
+            psu_sensorlow="0x"$psu_sensor"" && psu_sensorhign="0x"00"" 
+            ;;
+        2)
+            psu_sensorlow="0x"$psu_sensor"" && psu_sensorhign="0x"00""
+            ;;
+        3)
+            psu_sensorhign="0x"${psu_sensor:0:1}"" && psu_sensorlow="0x"${psu_sensor:1:4}""
+            ;;
+        4)
+            psu_sensorhign="0x"${psu_sensor:0:2}"" && psu_sensorlow="0x"${psu_sensor:2:4}""
+            ;;
+        *)
+            ;;
+    esac
+    if [ -n "$psu_sensorlow" -a -n "$psu_sensorhign" ]; then
+        psusensor=`${CMD_SUDO} ${CMD_IPMITOOL} raw 0x0a 0x43 0x00 0x00 "$psu_sensorlow" "$psu_sensorhign" 0x00 0xff | awk -F" " '{print $14}' | tr [a-z] [A-Z]`
+        dell_model=`echo $pub_model | tr [a-z] [A-Z]`
+        case "$dell_model" in 
+            *C6220*|*DCS6220*)
+                [[ $psusensor == "B6" ]] && psuslot="PSU 1"
+                [[ $psusensor == "B7" ]] && psuslot="PSU 2"
+                ;;
+            *R510*|*R710*|*1950*|*R610*|*2950*)
+                [[ $psusensor == "64" ]] && psuslot="PSU 1"
+                [[ $psusensor == "65" ]] && psuslot="PSU 2"
+                ;;
+            *R620*|*R720XD*|*DCS2210*|*R720*)
+                [[ $psusensor == "62" ]] && psuslot="PSU 1"
+                [[ $psusensor == "63" ]] && psuslot="PSU 2"
+                ;;
+            *C6100*)
+                [[ $psusensor == "A8" ]] && psuslot="PSU 1"
+                [[ $psusensor == "A9" ]] && psuslot="PSU 2"
+                ;; 
+            *DCS6100*)
+                [[ $psusensor == "A6" ]] && psuslot="PSU 1"
+                [[ $psusensor == "A7" ]] && psuslot="PSU 2"
+                ;;
+            *FS12-TY*|*C2100*|*CS24-TY*)
+                [[ $psusensor == "86" ]] && psuslot="PSU 1"
+                [[ $psusensor == "87" ]] && psuslot="PSU 2"
+                ;;
+            *C5220*)
+                [[ $psusensor == "CB" ]] && psuslot="PSU 1"
+                [[ $psusensor == "CC" ]] && psuslot="PSU 2"
+                ;;
+            *R910*)
+                [[ $psusensor == "64" ]] && psuslot="PSU 1"
+                [[ $psusensor == "65" ]] && psuslot="PSU 2"
+                [[ $psusensor == "66" ]] && psuslot="PSU 3"
+                [[ $psusensor == "67" ]] && psuslot="PSU 4"
+                ;;
+            *)
+                ;;
+        esac
+        if [ -n "$psuslot" ]; then
+            pub_messageSend "power" "[ ERROR ]" "$psuinfo"
+            pub_messageAppend "Power Supply lost or failure detected!" 3
+            pub_IdcFreeCreate "$psuslot" "$psuinfo" "3"
+        else
+            pub_messageSend "power" "[ ERROR ]" "$psuinfo"
+            pub_messageAppend "Power Supply lost or failure detected!" 3
+            pub_IdcFreeCreate "$psudisk" "$psuinfo" "3"
+        fi
+    else
+        pub_messageSend "power" "[ ERROR ]" "$psuinfo"
+        pub_messageAppend "Power Supply lost or failure detected!" 3
+        pub_IdcFreeCreate "$psudisk" "$psuinfo" "3"
+    fi
+}
+function pub_check_sunlog() {
+    now_date=`date  +"%b %d" |sed -e 's/\([^0]\+\)0\(.*\)/\1 \2/'`
+    logsizesun=`du -k /var/adm/messages|awk '{print $1}'`
+    if test $logsizesun -ge 434400; then
+        exitstatus=$unknown
+        err_msg="/var/adm/messages too big !!"
+        return
+    else
+        errorcountsun=`${CMD_SUDO} grep -i "$now_date" /var/adm/messages | egrep -i "offline|medium error|I/O error."|wc -l`
+        if test $errorcountsun -ge 10; then
+            # exitstatus=$critical
+            diskstatus=$critical
+            $errorlog2=`${CMD_SUDO} grep -i "$now_date" /var/adm/messages | egrep -i "offline|medium error|I/O error."|head -n 8`
+            pub_messageAppend "$errorlog2" 1
+            pub_IdcFreeCreate "dmesg" "$msg" "5" #报修
+            return
+        else
+            exitstatus=$ok
+            #pub_messageAppend "dmesg check ok!"
+        fi
+    fi
+}
+
+function pub_main() {
+    os_type=`uname -s`
+    if [ $os_type == "SunOS" ]; then
+        pub_check_sunlog
+        pub_json_output
+        exit $exitstatus
+    elif [ $os_type == "Linux" ]; then
+        pub_check_root
+        pub_lock
+        pub_basetool
+        pub_isVirtualHost
+        pub_firstrun
+        #pub_read_write
+
+        pub_check_messages  #检查系统日志
+        pub_read_write
+        pub_check_ipmitool  #通过ipmitool检查内存错误
+
+        pub_motdEdit    #删除/etc/motd的硬件告警信息，用pub_message更新/etc/motd的硬件告警信息
+        pub_logfileAppend "$err_msg"
+        pub_logfileAppend "$disk_msg"
+        pub_logfileAppend "$mem_msg"
+        pub_logfileAppend "$pwr_msg"
+        pub_logfileAppend "$other_msg"
+        pub_json_output
+        pub_exit
+    fi
+}
+
+pub_main

@@ -1,0 +1,2056 @@
+#!/bin/bash
+#****************************************************************#
+# ScriptName: get_server_hardware.sh
+# Author: jinli.zjl@alibaba-inc.com
+# Create Date: 2014-01-01 17:09
+# Function: check server hardware
+#***************************************************************#
+
+#v1.0;2012-07-15;created by longjiang; amalgamate B2B Aliyun Taobao's check_hw ;and add some function like light LED、memcheck、suport idcfree and dragoon.
+#2012-07-31; modified by zhilin.lkw; remove tools installation functions.
+#2012-08-28; modification completed by zhilin.lkw; testing started.
+
+export PATH="/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin"
+export LANG="en_US.UTF-8"
+
+VER="v59"
+
+# COMMAND MACROS
+if grep -q "6\.[0-9]" /etc/redhat-release 2>/dev/null; then
+    CMD_YUM="/usr/bin/python2.6 /usr/bin/yum"
+elif grep -q "5\.[0-9]" /etc/redhat-release 2>/dev/null; then
+    CMD_YUM="/usr/bin/python2.4 /usr/bin/yum"
+elif grep -q "release 4" /etc/redhat-release 2>/dev/null; then
+    CMD_YUM="/usr/bin/python2.3 /usr/bin/yum"
+else
+    CMD_YUM="/usr/bin/yum"
+fi
+CMD_RPM="/bin/rpm"
+CMD_TAR="/bin/tar"
+CMD_LN="/bin/ln"
+CMD_TOUCH="/bin/touch"
+CMD_SED="/bin/sed"
+CMD_DMESG="/bin/dmesg"
+CMD_MKDIR="/bin/mkdir"
+CMD_MKNOD="/bin/mknod"
+CMD_CHKCONFIG="/sbin/chkconfig"
+CMD_SERVICE="/sbin/service"
+CMD_IP="/sbin/ip"
+CMD_IFCONFIG="/sbin/ifconfig"
+CMD_LSPCI="/sbin/lspci"
+CMD_MDADM="/sbin/mdadm"
+CMD_MODPROBE="/sbin/modprobe"
+CMD_FILE="/usr/bin/file"
+CMD_IPMITOOL="/usr/bin/ipmitool"
+CMD_WGET="/usr/bin/wget -T10 -t3 -w3 -c -q -P /tmp"
+CMD_CURL="/usr/bin/curl -m 10 --connect-timeout 5 -4 -s"
+CMD_INSTALL="/usr/bin/install"
+CMD_TEE="/usr/bin/tee"
+CMD_DMIDECODE="/usr/sbin/dmidecode"
+CMD_XM="/usr/sbin/xm"
+CMD_SMARTCTL="/usr/sbin/smartctl"
+CMD_LSIUTIL="/usr/local/sbin/lsiutil"
+CMD_HPACUCLI="/usr/sbin/hpacucli"
+CMD_HPACUCLI8="/usr/local/sbin/hpacucli-8.60-8.0/hpacucli"
+test `uname -i` = "x86_64" && CMD_MEGACLI="/opt/MegaRAID/MegaCli/MegaCli64" || CMD_MEGACLI="/opt/MegaRAID/MegaCli/MegaCli"
+CMD_MEGARC="/usr/local/sbin/megarc.bin"
+CMD_CFGGEN="/usr/local/sbin/cfggen"
+CMD_SAS2IRCU="/usr/local/sbin/sas2ircu"
+CMD_ARCCONF="/usr/local/sbin/arcconf"
+CMD_ARCCONF_SUN="/usr/StorMan/arcconf"
+#by luxue
+CMD_HWINFO_HELP="/usr/alisys/dragoon/libexec/armory/hwinfo/helper.py"
+errorfileinfo="/dev/shm/errorfileinfo.log"
+CHECK_NIC_BONDING0="/proc/net/bonding/"
+# status
+ok=0
+debug=1
+warning=1
+error=2
+critical=3
+unknown=4
+exitstatus=$ok
+bbustatus=$ok
+flagstatus=$ok
+
+# message handling
+msg=""
+err_msg=""
+
+# common global vars
+suf="`id -u`"
+[ x"$IS_VENDOR" = "x1" ] && IS_HWQC=1
+([ -e /etc/ramos-release ] || hostname | grep -qE 'RAMOS|NGIS') && IS_RAMOS=YES || IS_RAMOS=NO
+pub_alitype=
+pub_sn=
+
+# for logging
+pub_log_time=`date`
+pub_start_time=`date +'%Y-%m-%d %H:%M:%S'`
+
+# common URL, directories and hwinfo integration
+pub_tools_server="http://yum.tbsite.net/aliyun/5Server/x86_64/server/hardware/tool"
+pub_chkhw_logdir="/var/log/check_hw"
+pub_lock_file="/dev/shm/check_hardware.pid"
+pub_hwinfo="/etc/hwinfo/hwinfo.conf"
+pub_disk_raw=
+pub_slot=
+
+
+function getArmoryUrl(){
+#弹外的用a.am.alibaba-inc.com 开发测试用a.alibaba-inc.com 主站内网用api.a.alibaba-inc.com
+    armoryApiUlr=''
+    apiUrls=('api.a.alibaba-inc.com'  'a.alibaba-inc.com' 'a.am.alibaba-inc.com')
+    for ((i=0;i<${#apiUrls[@]};i++))
+    do
+           /usr/bin/nc -vzw2 ${apiUrls[$i]}  80 >/dev/null 2>&1
+           if [ "$?" == "0" ];then
+               echo ${apiUrls[$i]}
+               break
+           fi
+    done
+}
+
+# format json output
+function pub_json_output() {
+    [ -n "$err_msg" ] && flagstatus=$debug
+    # [ -z "$bbu_msg" ] && bbu_msg="OK"
+    #       {"name":"raidbbu", "status":$bbustatus, "msg":"$bbu_msg"}
+    cat<<EOF
+{
+    "collection_flag":$flagstatus,
+    "error_info":"${err_msg//\"/\"}",
+    "MSG":[
+        {"name":"general", "status":$exitstatus, "msg":"${msg//\"/\"}"}
+    ]
+}
+EOF
+}
+
+# write running log to /dev/shm/check_hardware.runtime and exit the script
+function pub_exit() {
+    local pri_chkhw_runtime=/dev/shm/check_hardware.runtime
+
+    if [[ `wc -l ${pri_chkhw_runtime} 2>/dev/null |awk '{print $1}'` -gt "500" ]]; then
+        ${CMD_SUDO} ${CMD_SED} -i '1,5d' ${pri_chkhw_runtime} &>/dev/null
+    fi
+    echo "$pub_start_time - `date +'%Y-%m-%d %H:%M:%S'` `basename $0` run complete as uid:`id -u` with ${VER}." | ${CMD_SUDO} ${CMD_TEE} -a ${pri_chkhw_runtime} >/dev/null 2>&1
+    if [ $exitstatus -eq $critical ]; then
+        exit $critical
+    elif [ $exitstatus -eq $error ]; then
+        exit $error
+    elif [ $exitstatus -eq $warning -o $flagstatus -eq $debug ]; then
+        exit 1
+    elif [ $exitstatus -eq $ok -a $flagstatus -eq $ok ]; then
+        exit 0
+    else
+        exit $unknown
+    fi
+}
+
+function pub_messageAppend() {
+    if [ -z "$msg" ]; then
+        msg="$1"
+    else
+        msg="$msg $1"
+    fi
+}
+
+# append message to /var/log/check_hw/check_hardware.log
+function pub_logfileAppend() {
+    [ -z "$1" ] && return
+    local pri_mes=$1
+    local pri_chkhw_log=${pub_chkhw_logdir}/check_hardware.log
+
+    if [[ `wc -l ${pri_chkhw_log} 2>/dev/null |awk '{print $1}'` -gt "2000" ]]; then
+        ${CMD_SED} -i '1,5d' ${pri_chkhw_log} &>/dev/null
+    fi
+    echo "$pub_log_time: $pri_mes" | ${CMD_SUDO} ${CMD_TEE} -a ${pri_chkhw_log} >/dev/null 2>&1
+}
+
+# append message to /var/log/messages
+function pub_messageSend() {
+    [ x"$IS_RAMOS" = "xYES" ] && return
+    local pri_MSG_CHN=$1  # MSG_CHN 为报告的频道: debug,version,selfmon,raidpd,raidld,raidbbu,storage,filesystem,mem
+    local pri_MSG_TAG=$2  # MSG_TAG 为报告关键字，其值范围为：[ OK ] 、[ DEBUG ] 、[ CRITICAL ]、 [ UNKNOW ]
+    local pri_MSG_TXT=$3  # MSG_TXT 为报告的内容(这个消息可考虑追加给$pub_message)
+    ${CMD_SUDO} logger -p daemon.info -t HWBMC "checkhw.${pri_MSG_CHN} ${pri_MSG_TAG} ${pri_MSG_TXT}" &>/dev/null
+
+}
+
+# Update message to /etc/motd
+function pub_motdEdit() {
+    [ -n "$bbu_msg" ] && bbu_msg=" $bbu_msg"
+    if [[ -z "$msg" && -z "$bbu_msg" ]]; then
+        msg="OK - Health check passed."
+    elif [ -z "$msg" ]; then
+        msg="OK - $bbu_msg"
+    elif [ $exitstatus -eq $critical ]; then
+        msg="Critical - ${msg} ${bbu_msg}"
+    elif [ $exitstatus -eq $error ]; then
+        msg="Error - ${msg} ${bbu_msg}"
+    else
+        msg="Warning - ${msg} ${bbu_msg}"
+    fi
+    ${CMD_SUDO} ${CMD_SED} '/Check Hardware Notice/d' -i /etc/motd &>/dev/null
+    #if echo $msg|grep -qE "^Critical|^Error"; then
+    #    echo "Check Hardware Notice:["$msg"], check it in http://idc.alibaba-inc.com/" | ${CMD_SUDO} ${CMD_TEE} -a /etc/motd >/dev/null 2>&1
+    #elif echo $msg | grep -q "^Warning"; then
+    #    echo "Check Hardware Notice:["$msg"], not reported to IDCFree as it's not critical yet" | ${CMD_SUDO} ${CMD_TEE} -a /etc/motd >/dev/null 2>&1
+    #elif [ -n "$bbu_msg" ]; then
+    #    bbu_msg=$(echo $bbu_msg)
+    #    echo "Check Hardware Notice:["$bbu_msg"]" | ${CMD_SUDO} ${CMD_TEE} -a /etc/motd >/dev/null 2>&1
+    #fi
+}
+
+# report to IDCFree
+function pub_IdcFreeCreate() {
+
+    # if scheduled by HWQC in Vendor environment.
+    [ x"$IS_VENDOR" = "x1" ] && return
+
+    local pri_error_disk=$1   #坏盘
+    local pri_error_log=$2   #错误日志
+    # 错误类型 1:硬盘故障,2:内存故障,3:电源故障,4:主板故障,5:其他,6:CPU故障,7:带外故障,8:SAS/RAID卡故障,9:raid卡电池故障,0:LogicDrive故障,a:mdstat故障
+    local pri_error_type=$3
+    local pri_slot=$4
+    local pri_raw=""
+    local pri_error_slot=""
+    local pri_api="repairapi"
+
+    # select pri_api
+    #[ x"$IS_HWQC"   = "x1" ] && pri_api=hwqcAPI
+    #[ x"$IS_IDCNEW" = "x1" ] && pri_api=xinsunAPI
+
+    if [ x"$pri_error_type" = "x1" ]; then
+        if [ -n "$pri_slot" ]; then
+            pub_fetch_hwinfo "$pri_slot"
+        fi
+        if [ -n "$pub_disk_raw" ]; then
+            pri_raw="&rawData=$pub_disk_raw"
+            #pri_error_log="Slot=Y | $pri_error_log"
+        else
+            pri_raw=""
+        fi
+    fi
+
+    [ x"$pub_slot" != "x" ] && pri_error_slot="&errorSlot=$pub_slot" || pri_error_slot=""
+    if [ x"$IS_HWQC"   = "x1" ]; then
+        err_msg="Error - report to IDCFree failed: &type=$pri_error_type&errorDisk=$pri_error_disk&remark=$pri_error_log$pri_raw$pri_error_slot"    
+    else
+        ${CMD_CURL} -d "userName=$pri_api&sn=$pub_sn&type=$pri_error_type&errorDisk=$pri_error_disk&remark=$pri_error_log$pri_raw$pri_error_slot" 'http://idc.alibaba-inc.com/repairapi!create.jspa' >/dev/null
+        if [ $? -ne 0 ]; then #如果失败就报修到公网API地址
+            ${CMD_CURL} -d "userName=$pri_api&sn=$pub_sn&type=$pri_error_type&errorDisk=$pri_error_disk&remark=$pri_error_log$pri_raw$pri_error_slot" 'http://42.156.166.86/repairapi!create.jspa' >/dev/null
+            if [ $? -ne 0 ]; then
+                ${CMD_CURL} -d "userName=$pri_api&sn=$pub_sn&type=$pri_error_type&errorDisk=$pri_error_disk&remark=$pri_error_log$pri_raw$pri_error_slot" 'http://100.67.16.32/repairapi!create.jspa' >/dev/null
+                if [ $? -ne 0 ]; then
+                    ${CMD_CURL} -d "userName=$pri_api&sn=$pub_sn&type=$pri_error_type&errorDisk=$pri_error_disk&remark=$pri_error_log$pri_raw$pri_error_slot" 'http://110.75.103.51/repairapi!create.jspa' >/dev/null
+                    if [ $? -eq 0 ]; then
+                        err_msg="Error - report to IDCFree failed: &type=$pri_error_type&errorDisk=$pri_error_disk&remark=$pri_error_log$pri_raw$pri_error_slot"
+                        pub_logfileAppend "$err_msg"
+                    fi
+                fi
+            fi
+        fi
+    fi
+}
+
+# Query idcfree records
+function pub_IdcFreeQuery() {
+
+    [ x"$IS_VENDOR" = "x1" ] && return 0
+
+    local pri_error_type=`echo "$1"|grep -E "^[0-9]+$"`
+    [ -z "$pri_error_type" ] && pri_error_type=1
+
+    local pri_idcfree_record
+    local pri_idcfree_count
+    pri_idcfree_record=`${CMD_CURL} -d "isCount=true&sn=$pub_sn&types=$pri_error_type&states=2,3,a,b,c,e,t,u,j,k,l" 'http://idc.alibaba-inc.com/repairapi!search.jspa' 2>/dev/null`
+    if [ -z $pri_idcfree_record ]; then
+        pri_idcfree_record=`${CMD_CURL} -d "isCount=true&sn=$pub_sn&types=$pri_error_type&states=2,3,a,b,c,e,t,u,j,k,l" 'http://42.156.166.86/repairapi!search.jspa' 2>/dev/null`
+        if [ -z $pri_idcfree_record ]; then
+            pri_idcfree_record=`${CMD_CURL} -d "isCount=true&sn=$pub_sn&types=$pri_error_type&states=2,3,a,b,c,e,t,u,j,k,l" 'http://100.67.16.32/repairapi!search.jspa' 2>/dev/null`
+            if [ -z $pri_idcfree_record ]; then
+                pri_idcfree_record=`${CMD_CURL} -d "isCount=true&sn=$pub_sn&types=$pri_error_type&states=2,3,a,b,c,e,t,u,j,k,l" 'http://110.75.103.51/repairapi!search.jspa' 2>/dev/null`
+            fi
+        fi
+    fi
+    pri_idcfree_count=`echo "$pri_idcfree_record" | grep -E "^[0-9]+$"`
+
+    return $pri_idcfree_count
+}
+
+# avoid duplicated running
+function pub_lock() {
+    if [ -e $pub_lock_file ] && ${CMD_SUDO} grep -qE "^[0-9]+$" $pub_lock_file; then
+        pri_proc_cmdline="`${CMD_SUDO} cat /proc/$(cat $pub_lock_file)/cmdline 2>/dev/null`"
+        if echo "$pri_proc_cmdline" | grep -q "`basename $0`"; then
+            [[ x"$IS_HWQC" = "x1" ]] && ignoreinfo="[Ignore_duplicated_run]" || ignoreinfo=""
+            exitstatus=$unknown
+            err_msg="$ignoreinfo Error - pid $(cat $pub_lock_file) is running! my pid is $$; conflict: $pri_proc_cmdline"
+            pub_json_output
+            exit $unknown
+        fi
+    fi
+    echo $$ | ${CMD_SUDO} ${CMD_TEE} $pub_lock_file >/dev/null 2>&1
+}
+
+function pub_vm_exit() {
+    msg="OK - VM box pass."
+    exitstatus=$ok
+    pub_json_output
+    pub_exit
+}
+
+# check if it's root
+# check if non-root accounts have sudo priv
+function pub_check_root() {
+    # root
+    if [ $suf -eq 0 ]; then
+        CMD_SUDO=""
+        return
+    fi
+    # not root, no sudo
+    if [ ! -x /usr/bin/sudo ]; then
+        exitstatus=$unknown
+        err_msg="Error - sudo package is not installed!"
+        pub_json_output
+        exit $unknown
+    fi
+
+    # not root, has sudo
+    CMD_SUDO="/usr/bin/sudo"
+    sudo true 2>/dev/null && return
+
+    # if no sudo priv, check if it's vm first
+    cat /etc/hwinfo/hwinfo.conf 2>/dev/null | grep -oE "system_hypervisor_type[^,]+," | grep -qE "xen-domU|container" && pub_vm_exit
+    cat /proc/self/cgroup 2>/dev/null | grep -qE "^[0-9]+:.+:/.+$" && pub_vm_exit
+    if [ -x ${CMD_FILE} ]; then
+        ${CMD_FILE} ${CMD_DMIDECODE} 2>/dev/null | grep -qE "ELF.*executable" || pub_vm_exit
+    fi
+
+    # if it's not VM
+    exitstatus=$unknown
+    err_msg="Error - sudo execution failed!"
+    pub_json_output
+    exit $unknown
+}
+
+# check if basic commands like lspci and dmidecode exists.
+function pub_basetool() {
+    test -x ${CMD_LSPCI} || ${CMD_SUDO} ${CMD_YUM} -y pciutils &>/dev/null
+    test -x ${CMD_DMIDECODE} || ${CMD_SUDO} ${CMD_YUM} -y dmidecode &>/dev/null
+
+    if [ ! -x ${CMD_LSPCI} -o ! -x ${CMD_DMIDECODE} ]; then
+        err_msg="Error - dmidecode or lspci does not exist!"
+        pub_messageSend "debug" "[ DEBUG ]" "dmidecode or lspci does not exist!"
+        exitstatus=$unknown
+        pub_json_output
+        exit $unknown
+    fi
+}
+
+# we don't check VM issues.
+# touch a file named /etc/HOSTISVM if VM
+function pub_isVirtualHost() {
+    # check hwinfo
+    hyper_type=`cat /etc/hwinfo/hwinfo.conf 2>/dev/null | grep -oE "system_hypervisor_type[^,]+,"`
+    echo "$hyper_type" | grep -qE "xen xen-dom0" && return
+    echo "$hyper_type" | grep -qE "xen-domU|container"     && pub_vm_exit
+
+    # 'control_d' if dom0, empty if domU
+    if [ -f /proc/xen/capabilities ]; then
+        ${CMD_SUDO} grep -iq 'control_d' /proc/xen/capabilities && return || pub_vm_exit
+    fi
+
+    # LXC container check
+    cat /proc/self/cgroup 2>/dev/null | grep -qE "^[0-9]+:.+:/.+$" && pub_vm_exit
+
+    # script or text file in some guest
+    if [ -x ${CMD_FILE} ]; then
+        ${CMD_FILE} ${CMD_DMIDECODE} 2>/dev/null | grep -qE "ELF.*executable" || pub_vm_exit
+    fi
+
+    # console=xvc0 if guest
+    grep -q 'console=xvc0' /proc/cmdline && pub_vm_exit
+
+    # dmidecode  check
+    pri_result=`${CMD_SUDO} ${CMD_DMIDECODE} 2>/dev/null`
+    echo "$pri_result" | grep "Vendor" | grep -qi 'xen' && pub_vm_exit
+    echo "$pri_result" | grep "Prod" | grep -qE "KVM|VMware|Bochs" && pub_vm_exit
+}
+
+function pub_raid_type() {
+    raidtype=""
+    lsmod=`/sbin/lsmod`
+    lspci=`${CMD_SUDO} ${CMD_LSPCI} 2>/dev/null`
+
+    # mptSAS/mpt2SAS
+    echo $lsmod | egrep -qw "mptsas|mptbase|mpt2sas"
+    if [ $? -eq 0 ] && [ -z $raidtype ]; then
+        if echo $lsmod | egrep -qw "mpt2sas" && echo $lspci | grep -q "SAS2"; then
+            raidtype="mpt2SAS"
+        elif echo $lsmod | egrep -qw "mptsas" && echo $lspci | grep -q "SAS1" ||
+             echo $lsmod | egrep -qw "megaraid_sas,mptsas"; then
+                raidtype="mptSAS"
+        fi
+        if ! test -c /dev/mptctl; then
+            ${CMD_SUDO} ${CMD_MKNOD} /dev/mptctl c 10 220
+            ${CMD_SUDO} ${CMD_MODPROBE} mptctl &>/dev/null
+        fi
+    fi
+    # MegaRAID SCSI
+    echo $lsmod | egrep -qw "megaraid_mbox|megaraid2"
+    if [ $? -eq 0 ] && [ -z $raidtype ]; then
+        raidtype="megaRAIDSCSI"
+    fi
+    # MegaRAID SAS
+    echo $lsmod | egrep -qw "megaraid_sas"
+    if [ $? -eq 0 ] && [ -z $raidtype ]; then
+        raidtype="megaRAIDSAS"
+    fi
+    # aacRAID
+    echo $lsmod | egrep -qw "aacraid"
+    if [ $? -eq 0 ] && [ -z $raidtype ]; then
+        raidtype="aacraid"
+    fi
+    # HP RAID
+    echo "$lspci" | grep -iE "RAID|SCSI|SAS|SATA" | grep -q "Hewlett-Packard" && echo $lsmod | grep -qE "cciss|hpsa"
+    if [ $? -eq 0 ] && [ -z $raidtype ]; then
+        raidtype="hpraid"
+    fi
+    # MegaRAID SAS
+    echo "$lspci" | grep -qE "MegaRAID|Dell PowerEdge Expandable RAID controller|MegaRAID SAS"
+    if [ $? -eq 0 ] && [ -z $raidtype ]; then
+        raidtype="megaRAIDSAS"
+    fi
+    if [ -z $raidtype ]; then
+        raidtype="unknown"
+        # echo "this host raid is unknown raid"
+    fi
+
+    lsiutil_hang=0
+    pri_raidcard=${pub_chkhw_logdir}/raidcard
+    if [ "$raidtype" = "mptSAS" ] || [ "$raidtype" = "mpt2SAS" ]; then
+        #3.04版本mptsas驱动程序会导致lsiutil、cfggen等执行过程中造成kernel panic
+        if cat /sys/module/mptsas/version 2>/dev/null | grep -qE "^3\.04"; then
+            lsiutil_hang=1
+        fi
+    fi
+    if [ "$raidtype" = "aacraid" -o "$raidtype" = "hpraid" ]; then
+        echo "raidcard" | ${CMD_SUDO} ${CMD_TEE} ${pri_raidcard} &>/dev/null
+    elif [ "$raidtype" != "megaRAIDSAS" ]; then
+        [ -e ${pri_raidcard} ] && echo "" | ${CMD_SUDO} ${CMD_TEE} ${pri_raidcard} &>/dev/null
+    fi
+}
+
+# install missing tools
+function pub_tools_install() {
+    if [ ! -e /dev/shm/check_hardware.install ]; then
+        pub_check_download_server
+        if pub_check_hw_install; then
+            ${CMD_SUDO} ${CMD_TOUCH} /dev/shm/check_hardware.install
+        fi
+        ${CMD_SUDO} ${CMD_IPMITOOL} sel time set "`date +%m/%d/%Y\ %H:%M:%S`" >/dev/null 2>&1 &
+    fi
+}
+
+function pub_check_download_server() {
+    # get reachable download_server ip
+    if hostname | grep -qE "\.cn[0-9]+|\.l2cn[0-9]+"; then
+        ips="yum.corp.taobao.com yum.tbsite.net 172.24.102.213 42.120.195.193"
+    else
+        ips="yum.tbsite.net 172.24.102.213 yum.corp.taobao.com 42.120.195.193"
+    fi
+    download_server=yum.tbsite.net
+    for ip in $ips; do
+        if ping -w 2 -q $ip >/dev/null 2>&1; then
+            download_server=$ip
+            break;
+        fi
+    done
+    export pub_tools_server="http://${download_server}/aliyun/5Server/x86_64/server/hardware/tool"
+}
+
+# installation entry function
+function pub_check_hw_install() {
+    # remove out-dated tops-checkhardware
+    ${CMD_RPM} -q --quiet tops-checkhardware &>/dev/null && ${CMD_SUDO} ${CMD_RPM} -e tops-checkhardware &>/dev/null
+
+    # install hdmontools
+    ${CMD_RPM} -q --quiet tops-hdmontools &>/dev/null || ${CMD_SUDO} ${CMD_YUM} -y install tops-hdmontools &>/dev/null
+
+    # install mce/ipmi
+    ${CMD_RPM} -q --quiet mcelog &>/dev/null || ${CMD_SUDO} ${CMD_YUM} -y install mcelog &>/dev/null
+    pub_install_ipmi
+
+    # install smartctl
+    [ -x ${CMD_SMARTCTL} ] || ${CMD_SUDO} ${CMD_YUM} -y install smartmontools &>/dev/null
+    uname -i | grep -q 64 && smartctltool='smartctl' || smartctltool='smartctl32'
+    pub_install "$smartctltool" "${CMD_SMARTCTL}"
+
+    # install raid tools
+    if test "$raidtype" = "megaRAIDSAS"; then
+        pub_install_megacli
+        exitstatus=$?
+        pub_install_lsiutil
+        return $exitstatus
+    elif test "$raidtype" = "hpraid"; then
+        pub_install_hpacucli
+        exitstatus=$?
+        return $exitstatus
+    elif test "$raidtype" = "megaRAIDSCSI"; then
+        pub_install_megarc
+        exitstatus=$?
+        return $exitstatus
+    elif test "$raidtype" = "mptSAS"; then
+        pub_install "cfggen" "${CMD_CFGGEN}"
+        exitstatus=$?
+        pub_install_lsiutil
+        return $exitstatus
+    elif test "$raidtype" = "aacraid"; then
+        pub_install_arcconf
+        exitstatus=$?
+        return $exitstatus
+    elif test "$raidtype" = "mpt2SAS"; then
+        pub_install "sas2ircu" "${CMD_SAS2IRCU}"
+        exitstatus=$?
+        pub_install_lsiutil
+        return $exitstatus
+    elif test "$raidtype" = "unknown"; then
+        return $exitstatus
+    fi
+
+    return 0
+}
+
+function pub_install_ipmi() {
+    ${CMD_RPM} --quiet -q OpenIPMI || ${CMD_SUDO} ${CMD_YUM} -y install OpenIPMI &>/dev/null
+    if [ -e /etc/init.d/ipmi ]; then
+        ${CMD_SUDO} ${CMD_CHKCONFIG} ipmi on &>/dev/null
+        if ps ax 2>/dev/null|awk '$3~/D/'|grep -q ipmi; then
+            # TODO: OpenIPMI service hang
+            :
+        else
+            if ! /etc/init.d/ipmi status &>/dev/null; then
+                ${CMD_SUDO} ${CMD_SERVICE} ipmi start &>/dev/null &
+            fi
+        fi
+    else
+        pub_messageAppend "OpenIPMI service installation failed!"
+        pub_messageSend "debug" "[ DEBUG ]" "$msg"
+    fi
+
+    if grep -q "6\.[0-9]" /etc/redhat-release 2>/dev/null; then
+        ${CMD_RPM} --quiet -q ipmitool || ${CMD_SUDO} ${CMD_YUM} -y install ipmitool &>/dev/null
+    else
+        ${CMD_RPM} --quiet -q OpenIPMI-tools || ${CMD_SUDO} ${CMD_YUM} -y install OpenIPMI-tools &>/dev/null
+    fi
+    [ -x ${CMD_IPMITOOL} ] || {
+        pub_messageAppend "ipmitool installation failed!"
+        pub_messageSend "debug" "[ DEBUG ]" "$msg"
+        return 1
+    }
+}
+
+function pub_install() {
+    pri_tool_download=$1
+    pri_tool_name=$2
+
+    [ -x ${pri_tool_name} ] || {
+        if ${CMD_WGET} ${pub_tools_server}/${pri_tool_download} ; then
+            ${CMD_SUDO} ${CMD_INSTALL} -g root -o root -m 755 /tmp/${pri_tool_download} ${pri_tool_name}
+        else
+            pub_messageAppend "wget FAIL, ${pri_tool_name} installation failed."
+            pub_messageSend "debug" "[ DEBUG ]" "$msg"
+            return 1
+        fi
+        [ -x ${pri_tool_name} ] || {
+            pub_messageAppend "${pri_tool_name} installation failed."
+            pub_messageSend "debug" "[ DEBUG ]" "$msg"
+            return 1
+        }
+    }
+}
+
+function pub_install_megacli() {
+    local megacli_installed=0
+    if [ -x ${CMD_MEGACLI} ]; then
+        ${CMD_SUDO} ${CMD_MEGACLI} -v -NoLog 2>/dev/null | grep -qE "8.02.16|8.04.07"
+        if [ $? -ne 0 ]; then
+            ${CMD_SUDO} ${CMD_RPM} -e MegaCli &>/dev/null
+            ${CMD_SUDO} ${CMD_YUM} -y install MegaCli-8.04.07-1 &>/dev/null
+        fi
+    else
+        ${CMD_SUDO} ${CMD_YUM} -y install MegaCli-8.04.07-1 &>/dev/null
+    fi
+
+    if [ ! -x ${CMD_MEGACLI} ]; then
+        pub_messageAppend "MegaCli installation failed!"
+        pub_messageSend "debug" "[ DEBUG ]" "$msg"
+        return 1
+    fi
+}
+
+function pub_install_lsiutil() {
+    local lsiutil_installed=0
+    if [ -x ${CMD_LSIUTIL} ]; then
+        lsiutil_installed=1
+        ${CMD_SUDO} ${CMD_LSIUTIL} -b &>/dev/null || lsiutil_installed=0
+        ${CMD_SUDO} ${CMD_LSIUTIL} -b 2>/dev/null | grep -qE "Version 1.63|Version 1.67" || lsiutil_installed=0
+    fi
+    if [ $lsiutil_installed -eq 0 ]; then
+        test `uname -i` = "x86_64" && local pri_cmd=lsiutil || local pri_cmd=lsiutil32
+        rm -f /tmp/${pri_cmd} &>/dev/null
+        if ${CMD_WGET} ${pub_tools_server}/${pri_cmd} ; then
+            ${CMD_SUDO} ${CMD_INSTALL} -g root -o root -m 755 /tmp/${pri_cmd} ${CMD_LSIUTIL}
+        else
+            pub_messageAppend "wget FAIL, lsiutil installation failed."
+            pub_messageSend "debug" "[ DEBUG ]" "$msg"
+            return 1
+        fi
+        [ -x ${CMD_LSIUTIL} ] || {
+            pub_messageAppend "lsiutil installation failed!"
+            pub_messageSend "debug" "[ DEBUG ]" "$msg"
+            return 1
+        }
+    fi
+}
+
+# TODO: use hpssacli
+function pub_install_hpacucli() {
+    if echo $pub_model | grep -q "DL185 G5"; then
+        if ! ${CMD_SUDO} [ -x ${CMD_HPACUCLI} ] || ! ${CMD_SUDO} ${CMD_HPACUCLI} version 2>/dev/null | grep -q "Version: 8"; then
+            ${CMD_SUDO} ${CMD_RPM} -e hpacucli --nodeps &>/dev/null
+            # FIXME: use yum instead
+            if ${CMD_WGET} ${pub_tools_server}/hpacucli-8.60-8.0.noarch.rpm ; then
+                ${CMD_SUDO} ${CMD_YUM} localinstall -y /tmp/hpacucli-8.60-8.0.noarch.rpm &>/dev/null || {
+                    pub_messageAppend "hpacucli-8.60-8.0.noarch.rpm installation failed."
+                    pub_messageSend "debug" "[ DEBUG ]" "$msg"
+                    return 1
+                }
+            else
+                pub_messageAppend "wget hpacucli-8.60-8.0.noarch.rpm failed."
+                pub_messageSend "debug" "[ DEBUG ]" "$msg"
+                return 1
+            fi
+        fi
+    else
+        if ! ${CMD_SUDO} [ -x ${CMD_HPACUCLI} ] || ! ${CMD_SUDO} ${CMD_HPACUCLI} version 2>/dev/null | grep -q "Version: 9"; then
+            ${CMD_SUDO} ${CMD_RPM} -e hpacucli --nodeps &>/dev/null
+            ${CMD_SUDO} ${CMD_YUM} -y install hpacucli-9.10 &>/dev/null
+        fi
+    fi
+}
+
+function pub_install_megarc() {
+    pub_install "megarc.bin" "/usr/local/bin/megarc.bin"
+    [ -x ${CMD_MEGARC} ] || ${CMD_SUDO} ${CMD_LN} -s "/usr/local/bin/megarc.bin" "${CMD_MEGARC}"
+}
+
+function pub_install_arcconf() {
+    if grep -Eq "6\.[0-9]" /etc/redhat-release 2>/dev/null; then
+        ${CMD_RPM} --quiet -q compat-libstdc++-33.i686 || ${CMD_SUDO} ${CMD_YUM} -y install compat-libstdc++-33.i686 &>/dev/null
+    else
+        ${CMD_RPM} --quiet -q compat-libstdc++-33.i386 || ${CMD_SUDO} ${CMD_YUM} -y install compat-libstdc++-33.i386 &>/dev/null
+    fi
+    pub_install "arcconf" "${CMD_ARCCONF}"
+}
+
+function pub_firstrun() {
+    ${CMD_SUDO} ${CMD_TOUCH} /dev/shm/NOT_RUN_DRAGOON_CHECK_HARDWARE >/dev/null 2>&1
+    test -d ${pub_chkhw_logdir} || ${CMD_SUDO} ${CMD_MKDIR} -p ${pub_chkhw_logdir} 2>/dev/null
+
+    export pub_sn=$(echo $(${CMD_SUDO}      ${CMD_DMIDECODE} -s system-serial-number 2>/dev/null | tail -1))
+    export pub_alitype=$(echo $(${CMD_SUDO} ${CMD_DMIDECODE} -s chassis-version      2>/dev/null | tail -1))
+    export pub_model=$(echo $(${CMD_SUDO}   ${CMD_DMIDECODE} -s system-product-name  2>/dev/null | tail -1))
+    export pub_vendor=$(echo $(${CMD_SUDO}  ${CMD_DMIDECODE} -s system-manufacturer  2>/dev/null | tail -1))
+}
+
+function pub_sas2ircu_timeout() {
+    waitfor=10
+    ${CMD_SUDO} ${CMD_SAS2IRCU} LIST >/dev/null 2>&1 &
+
+    while pgrep sas2ircu -P $$ >/dev/null ; do
+        sleep 1
+        ((waitfor--))
+        if [ $waitfor -eq 0 ]; then
+            ${CMD_SUDO} killall -9 sas2ircu -P $$ >/dev/null 2>&1 &
+            wait $!
+            return 127
+        fi
+    done
+    return 0
+}
+
+function pub_has_huatuo() {
+    if ${CMD_SUDO} [ -e /home/admin/badnode_monitor/huatuo_version ]; then
+        return 0
+    fi
+    if [ -e /dev/shm/DISK_NOT_RUN_CHECK_HARDWARE ]; then
+        return 0
+    fi
+    return 1
+}
+
+function pub_is_ecs_host() {
+    if [ x"`uname -r`" = "x2.6.32.36xen" ] || uname -r | grep -q "houyi"; then
+        return 0
+    fi
+    return 1
+}
+
+function pub_fetch_hwinfo() {
+    local pri_diskinfos=
+    local pri_diskinfo_inuse=""
+    local pri_diskinfo_unknown=""
+    local pri_slot=$1
+
+    if [[ -e $pub_hwinfo ]]; then
+        pri_diskinfos=`grep -oE "\{[^{}]+slot[^{}]+$pri_slot[^0-9]+[^{}]+}" $pub_hwinfo`
+        pri_diskinfo_inuse=`echo "$pri_diskinfos" | grep "inuse" | head -1`
+        pri_diskinfo_unknown=`echo "$pri_diskinfos" | grep "unknown" | head -1`
+
+        if [[ -n "$pri_diskinfo_inuse" ]]; then # disk is available
+            pub_disk_raw="$pri_diskinfo_inuse"
+        elif [[ -n "$pri_diskinfo_unknown" ]]; then # disk was available
+            pub_disk_raw="$pri_diskinfo_unknown"
+        else
+            pub_disk_raw=""
+            return
+        fi
+    fi
+}
+
+#######################################################################
+######################## CHECK FUNCTIONS ###############################
+########################################################################
+
+# Memory health check
+function pub_check_memoryHealth () {
+    local pri_Memtotal
+    local pri_MemtotalG
+    local pri_Dmitotal
+    local pri_DmitotalG
+    local pri_i
+    local pri_size
+    local pri_dif
+    local pri_is_xenServer
+
+    # don't check if mem=XXXM in /proc/cmdline
+    if grep -q 'mem=' /proc/cmdline; then
+        return
+    fi
+
+    pri_is_xenServer=`cat /sys/hypervisor/type 2>/dev/null`
+
+    #检查dmidecode和meminfo或者xm info看到的内存是否一致
+    if uname -r | grep -iq ESX; then # ESX-i Server
+        pri_Memtotal=`cat /proc/meminfo | grep MachineMem | awk '{ print $2 }'`
+        pri_MemtotalG=`expr $pri_Memtotal \/ 1024 \/ 1024`
+    elif [ -n "$pri_is_xenServer" ]; then # Xen Hypervisor
+        if [ -x ${CMD_XM} ]; then
+            ${CMD_SUDO} ${CMD_XM} info &>/dev/null
+            if [ $? -eq 0 ]; then
+                pri_Memtotal=`${CMD_SUDO} ${CMD_XM} 2>/dev/null info|grep "total_memory"|awk '{print $NF}'`
+                pri_MemtotalG=`echo "scale=3; $pri_Memtotal / 1024" | bc 2>/dev/null`
+                pri_MemtotalG=`echo $pri_MemtotalG |awk '{printf "%.0f",$1}'`
+                [ $pri_MemtotalG -eq 0 ] && return #Xen的BUG，有时取内存会取到0GB，取到则跳过
+            else
+                return
+            fi
+        fi
+    else #非xen/ESX宿主机的物理机,通过/proc/meminfo看系统当前认到的内存总GB数。
+        pri_Memtotal=`cat /proc/meminfo | grep MemTotal | awk '{print $2}'`
+        # BIOS might reserve some memory
+        pri_reserved=`cat /var/log/dmesg 2>/dev/null | grep Memory | grep -oE ", [0-9]+k reserved" | awk '{ print $2 }' | sed 's/k//'`
+        [[ -n "$pri_reserved" ]] || pri_reserved=0
+        pri_Memtotal=`expr $pri_Memtotal + $pri_reserved`
+        pri_MemtotalG=`echo "scale=3; $pri_Memtotal / 1024 / 1024 " | bc 2>/dev/null`
+        [ -z "$pri_MemtotalG" ] && return #假如未安装bc，则跳过检查
+        pri_MemtotalG=`echo $pri_MemtotalG |awk '{printf "%.0f",$1}'`
+    fi
+
+    if uname -i 2>/dev/null | grep -q "i[0-9]86"; then
+        [ $pri_MemtotalG -ge 3 ] && return
+    fi
+    # 1G Huge Page 会占用物理内存，但是dmesg里的reserved内存会包括这一段。
+    if ([ -z "$pri_reserved" ] || [ $pri_reserved -eq 0 ]) && cat /proc/cmdline | grep -qE "hugepagesz=1G hugepages=[0-9]+"; then
+        pri_hpages=$(cat /proc/cmdline | grep -oE "hugepagesz=1G hugepages=[0-9]+" | awk -F= '{ print $NF }')
+        pri_MemtotalG=`expr $pri_MemtotalG + $pri_hpages`
+    fi
+    # 通过dmidecode获取物理内存总GB数$DmitotalG
+    pri_mems=$(${CMD_SUDO} ${CMD_DMIDECODE} -t memory 2>/dev/null | grep -w "\WSize" | grep -w "MB" | awk '$2!~/No/ {print $2}')
+    for pri_i in $pri_mems; do
+        pri_Dmitotal=`expr $pri_Dmitotal + $pri_i`
+    done
+    pri_DmitotalG=`expr $pri_Dmitotal / 1024`
+    if [ $pri_MemtotalG = $pri_DmitotalG ]; then
+        return
+    fi
+    # probably script bug
+    if [ $pri_DmitotalG -lt $pri_MemtotalG ]; then
+    #    exitstatus=$warning
+    #    pub_messageAppend "Check Memory, memTotal:${pri_MemtotalG}G > dmidecode:${pri_DmitotalG}G."
+    #    pub_messageSend "mem" "[ WARNING ]" "Check Memory,memTotal:${pri_MemtotalG}G > dmidecode:${pri_DmitotalG}G."
+        return
+    fi
+    pri_dif=`expr $pri_DmitotalG - $pri_MemtotalG`
+    for pri_size in `echo "$pri_mems" | sort | uniq`; do
+        pri_size=`expr $pri_size / 1024`        # 如2G/4G/8G的内存
+        [[ $pri_size -ge 1 ]] || continue       # 最少1G，否则不认为是内存
+        if [ $pri_dif -ge $pri_size ]; then     # 如果dmidecode认出的内存比系统内存多了单根内存容量(GB)，即：有内存条坏了。
+            exitstatus=$error
+            pub_messageAppend "Memory less than $pri_DmitotalG G [IN DMIDECODE], now $pri_MemtotalG G."
+            pub_IdcFreeQuery 2 && pub_IdcFreeCreate "unknown" "Memory less than $pri_DmitotalG G [IN DMIDECODE], now $pri_MemtotalG G." "2"
+            pub_messageSend "mem" "[ ERROR ]" "Memory less than $pri_DmitotalG G [IN DMIDECODE], now $pri_MemtotalG G."
+            return
+        fi
+    done
+}
+#by luxue
+#检查网卡故障
+function pub_check_nic(){
+    local EthernetSpeed
+    local RX_bytes
+    local Frame
+    local BER
+    local divisor=1
+    local bondingfile=`cat /sys/class/net/bonding_masters`
+    local eth_num=`ls /sys/class/net | grep "eth" | wc -l`
+    
+    for ((i=0; i<$eth_num; i++)); do
+        EthernetSpeed=`${CMD_SUDO} ethtool eth$i | grep Speed | awk -F":" '{print $NF}' | sed -e 's/^\s\+//;s/\s\+$//'`
+        if [ $EthernetSpeed != "1000Mb/s" ]; then
+            if [ $EthernetSpeed != "10000Mb/s" ]; then
+                exitstatus=$error
+                pub_messageAppend "Ethernet:Error Speed"
+                pub_messageSend "Error Ethernet Speed" "[ ERROR ]" "$msg"
+                pub_slot="Nic$i"
+                pub_IdcFreeCreate "Nic$i" "Please check the cable firstly, then switch port, and check nic last." "n" #报修
+                pub_slot=""
+            fi
+        fi
+        Frame=`ifconfig eth$i | grep "frame" | awk -F":" '{print $NF}' | sed -e 's/^\s\+//;s/\s\+$//'`
+        RX_bytes=`ifconfig eth$i | grep "RX bytes" | awk -F" " '{print $2}' | awk -F":" '{print $NF}' | sed -e 's/^\s\+//;s/\s\+$//'`
+        [[ $EthernetSpeed == "1000Mb/s" ]] && divisor=1250000000
+        [[ $EthernetSpeed == "10000Mb/s" ]] && divisor=125000000000
+        BER=`echo $RX_bytes $divisor | awk '{printf "%d\n",$1/$2}'`
+        if [ $BER -lt $Frame ]; then
+            exitstatus=$error
+            pub_messageAppend "Ethernet:Error packets"
+            pub_messageSend "Error Ethernet packets" "[ ERROR ]" "$msg"
+            pub_slot="Nic$i"
+            pub_IdcFreeCreate "Nic$i" "Please check the cable firstly, then switch port, and check nic last." "n" #报修
+            pub_slot=""
+        fi
+         
+        if [ -e "$CHECK_NIC_BONDING0/$bondingfile" ]; then
+            nic_bonding_status=`cat "$CHECK_NIC_BONDING0/$bondingfile" | grep "Slave Interface: eth$i" -A 2 | grep "MII Status" | awk -F":" '{print $NF}' | tr [a-z] [A-Z] | sed -e 's/^\s\+//;s/\s\+$//'`
+            if [ $nic_bonding_status != "UP" ]; then
+                exitstatus=$error
+                pub_messageAppend "Ethernet: bonding is not up."
+                pub_messageSend "Bonding is not up." "[ ERROR ]" "$msg"
+                pub_slot="Nic$i"
+                pub_IdcFreeCreate "Nic$i" "Please check the cable firstly, then switch port, and check nic last." "n" #报修
+                pub_slot=""
+            fi
+        fi 
+    done
+}
+
+function pub_check_mdstat() {
+    local pri_md_device
+    local pri_i
+    local pri_md_fail
+    local pri_disk_log
+    local pri_fail_log
+    local pri_fail_disk
+    local pri_disk
+    local pri_model
+    local pri_disk_slot
+    local pri_fail_slot
+    local pri_fail_model
+
+    if grep -q "active raid" /proc/mdstat &>/dev/null; then    #检查软Raid状态
+        for pri_md_device in `cat /proc/partitions | grep md | awk '{print $NF}' | grep -v "p[0-9]"`; do
+            pri_i=`${CMD_SUDO} ${CMD_MDADM} 2>/dev/null --detail /dev/$pri_md_device | grep -w "\WState" | awk -F: '{print $2}'`
+            if echo $pri_i |egrep -iwq "fail|degraded"; then
+                #exitstatus=$warning
+                #pub_messageAppend "$pri_md_device is $pri_i."
+                #pub_messageSend "raidld" "[ WARNING ]" "$pri_md_device is $pri_i."
+                pri_disk_log=`cat /proc/mdstat | grep $pri_md_device | grep "(F)"`
+                if [ -n "$pri_disk_log" ]; then
+                    #exitstatus=$warning
+                    for pri_disk in `echo "$pri_disk_log"|tr " " "\n"|grep "(F)"|awk -F\[ '{print $1}'|sed 's/[0-9]\+$//'|sed 's/p$//'`; do
+                        pri_model=`cat /sys/block/$pri_disk/device/model 2>/dev/null|sed 's/[ ]*$//g'`
+                        # pri_disk_slot=$(pub_disk_slot $pri_disk)
+                        if [ -z $pri_fail_disk ]; then
+                            pri_fail_disk="/dev/$pri_disk"
+                            pri_fail_model="$pri_model"
+                            # pri_fail_slot="$pri_disk_slot"
+                        elif echo $pri_fail_disk | grep -qw $pri_disk; then
+                            :
+                        else
+                            pri_fail_disk="$pri_fail_disk,/dev/$pri_disk"
+                            pri_fail_model="$pri_fail_model,$pri_model"
+                            # pri_fail_slot="$pri_fail_slot,$pri_disk_slot"
+                        fi
+                        pri_fail_log="$pri_fail_log $pri_disk_log"
+                    done
+                fi
+            fi
+        done
+
+        if [ -n "$pri_fail_disk" ]; then
+            pub_mdstat_fail=1
+            exitstatus=$error
+            pub_messageAppend "Failed disk: $pri_fail_disk, model: $pri_fail_model."
+            pub_IdcFreeCreate "$pri_fail_disk" "mdstat failed: $pri_fail_log, disk model: $pri_fail_model." "a"
+            pub_messageSend "raidpd" "[ ERROR ]" "Failed disk: $pri_fail_disk, model: $pri_fail_model."
+        fi
+    fi
+}
+
+function pub_check_std_disks() {
+    
+    # Only check in RamOS env
+    if [ x"$IS_RAMOS" = x"NO" ]; then
+        return
+    fi
+
+    if echo $pub_alitype | grep -qE "S9|S10|A7|A8"; then
+        alitype="$pub_alitype"
+    else
+        #armory_api="http://a.alibaba-inc.com/page/api/free/opsfreeInterface/search.htm?from=device&q=sn==${pub_sn}&select=sm_name&num=100&_username=droid/rms"
+        strDNS=$(getArmoryUrl)
+        armory_api="http://${strDNS}/page/api/free/opsfreeInterface/search.htm?from=device&q=sn==${pub_sn}&select=sm_name&num=100&_username=srmp"
+        alitype=$(${CMD_CURL} $armory_api | awk -F'sm_name":"' '{print $2}' | awk -F\" '{print $1}')
+    fi
+
+    case $alitype in
+        *S9*|*S10*)
+            disk_nm=$(ls /dev/sd? | wc -l)
+            if [ $disk_nm -eq 0 ]; then
+                pub_messageAppend "no disk detected, please check the enclosure!"
+                pub_messageSend "raidpd" "[ ERROR ]" "$msg"
+                #pub_IdcFreeCreate "no_disk" "no disk detected, please check the enclosure!" "1" #报修
+                echo -e "===================IDC===================\nSlot: All slots\nDisk SN: \nVendor: \n\n==================Device==================\nDevice:\nDisk Lable:\n\n================Error Info================\nS9 or S10 server. No disk detected, please check the enclosure." > $errorfileinfo 
+                pub_IdcFreeCreate "no_disk" "`cat $errorfileinfo`" "1" #报修
+                exitstatus=$error
+                rm -f $errorfileinfo
+            fi
+            ;;
+        *A7*|*A8*)
+            if [ ! -e /dev/sda ]; then
+                exitstatus=$error
+                pub_messageAppend "sda is missing"
+                pub_messageSend "raidpd" "[ ERROR ]" "sda is missing"
+                pub_slot="Slot0"
+                echo -e "===================IDC===================\nSlot: Slot0\nDisk SN:\nVendor:\n\n==================Device==================\nDevice:\nDisk Lable:\n\n================Error Info================\nA7 or A8 server has only one disk. Sda is missing." > $errorfileinfo 
+                pub_IdcFreeCreate "Slot0" "`cat $errorfileinfo`" "1"
+                pub_slot=""
+                rm -f $errorfileinfo
+            fi
+            ;;
+        *)
+            ;;
+    esac
+}
+
+function pub_checkmegasas() {
+    # check if RAID card exists
+    local ctrlCount=`${CMD_SUDO} ${CMD_MEGACLI} -adpCount -NoLog|grep -i "Controller Count"|sed 's/.*:.*\([0-9]\)\./\1/'`
+    local pri_raidcard="${pub_chkhw_logdir}/raidcard"
+
+    if test $ctrlCount -eq 0; then
+        [ -e ${pri_raidcard} ] && echo "" | ${CMD_SUDO} ${CMD_TEE} ${pri_raidcard} &>/dev/null
+        pub_smartctl_check
+        return $exitstatus
+    else
+        echo "raidcard" | ${CMD_SUDO} ${CMD_TEE} ${pri_raidcard} &>/dev/null
+    fi
+
+    # turn off all LEDs
+    local pri_loc
+    local pd_loc
+    local ad_loc
+    local pri_idcfree=0
+    local pri_led="${pub_chkhw_logdir}/led.log"
+
+    if [ -e ${pri_led} ] && [ x"`cat ${pri_led}`" != "x" ]; then
+        for pri_loc in $(cat ${pri_led}); do
+            ad_loc=$(echo "$pri_loc"|awk -F, '{print $2}')
+            pd_loc=$(echo "$pri_loc"|awk -F, '{print $1}')
+            ${CMD_SUDO} ${CMD_MEGACLI} -PdLocate -stop -physdrv[$pd_loc] -a$ad_loc -NoLog &>/dev/null
+        done
+        echo "" | ${CMD_SUDO} ${CMD_TEE} ${pri_led} &>/dev/null
+    fi
+
+    local i=0
+    local encl_id
+    local slot_id
+    local errcountadd
+    local mederrcount
+    local preerrcount
+    local disk_state
+    local disk_model
+    local disktotal
+    local pri_megacli_lock="/dev/shm/setMegacli.lock.$suf"
+    local pri_megacli_pd="/dev/shm/megacli_pdlist.txt.$suf"
+    local pri_megacli_ld="/dev/shm/megacli_ldinfo.txt.$suf"
+    local pri_megacli_all="/dev/shm/megacli_adpallinfo.txt.$suf"
+    local pri_megacli_bbu="/dev/shm/megacli_adpbbucmd.txt.$suf"
+    while test $i -lt $ctrlCount; do
+        #设置megacli卡的时间/开启Bad BBU写Cache(taobaoIDC服务器only),每天检查1次。
+        if ! ls -l --time-style=long-iso $pri_megacli_lock 2>/dev/null |grep -q `date +%Y-%m-%d`; then
+            ${CMD_TOUCH} $pri_megacli_lock &>/dev/null
+            if ! ${CMD_SUDO} ${CMD_MEGACLI} -AdpGetTime -a$i -NoLog 2>/dev/null|grep -E 'Date|Time'|awk '{print $2}'|tr "\n" "_"|grep -q `date +%m/%d/%Y_%H:%M`; then # 年月日时分不一致
+                ${CMD_SUDO} ${CMD_MEGACLI} -AdpSetTime `date '+%Y%m%d'` `date '+%H:%M:%S'` -a$i -NoLog &>/dev/null
+            fi
+            #设置强制写Cache
+            #if $megacli -LDInfo -Lall -aALL -NoLog 2>/dev/null|grep -qE "WriteThrough|No Write Cache if Bad BBU"; then   #需要开启Bad BBU写Cache
+            #   $megacli -LDSetProp CachedBadBBU -Lall -aALL -NoLog &>/dev/null
+            #   $megacli -LDSetProp WB -Lall -aALL -NoLog &>/dev/null
+            #fi
+        fi
+
+        #检查PD状态----------------
+        ${CMD_SUDO} ${CMD_MEGACLI} -PdList -a$i  -NoLog >$pri_megacli_pd 2>/dev/null
+        ${CMD_SUDO} ${CMD_MEGACLI} -AdpAllInfo  -a$i  -NoLog >$pri_megacli_all 2>/dev/null
+        disktotal=`cat $pri_megacli_pd|grep -i "Slot Number"|wc -l`
+
+        u=1
+        v=7
+        for x in `seq 1 $disktotal`; do
+            onepdlist=`cat $pri_megacli_pd|egrep -i "Media Error Count|Other Error Count|Predictive Failure Count|Enclosure Device ID|Slot Number|Firmware state|Inquiry Data"|sed -n ''$u','$v'p'`
+            cat $pri_megacli_pd |egrep -i "Media Error Count|Other Error Count|Predictive Failure Count|Enclosure Device ID|Slot Number|Firmware state|Inquiry Data" |sed -n ''$u','$v'p'|grep -i "Firmware state"|egrep -iq "online|Hotspare|Rebuild|JBOD"
+            if [ $? != 0 ]; then
+                encl_id=`echo $onepdlist|awk '{print $4}'`
+                slot_id=`echo $onepdlist|awk '{print $7}'`
+                # [[ "$encl_id" == "252" && $slot_id -gt 1 ]] && slot_id=`expr $slot_id - 2` #针对华为BH620 Enclosure 252 Slot号漂移的校正
+                disk_state=`echo $onepdlist|awk '{print $22}'|sed 's/,$//'`
+                if [ -n "$slot_id" ]; then
+                    disk_model=`echo $onepdlist|awk -F": " '{print $NF}'`
+                    pub_messageAppend "Disk Enclosure $encl_id Slot $slot_id is $disk_state, Model: $disk_model."
+                    if ! echo "$disk_state" | grep -q good; then
+                        exitstatus=$error
+                        pub_messageSend "raidpd" "[ ERROR ]" "$msg"
+                        # FIXME: multiple ctrl/encl?
+                        pub_slot="Slot$slot_id"
+                        device_name=`${CMD_HWINFO_HELP} --fields diskname,slot,serial_number,manufacturer disk | grep ":$slot_id," | awk -F"," '{print $1}'`
+                        disk_sn=`${CMD_HWINFO_HELP} --fields diskname,slot,serial_number,manufacturer disk | grep ":$slot_id," | awk -F"," '{print $3}'`
+                        disk_manu=`${CMD_HWINFO_HELP} --fields diskname,slot,serial_number,manufacturer disk | grep ":$slot_id," | awk -F"," '{print $4}'`
+                        vendor=`echo $pub_vendor | tr [a-z] [A-Z]`
+                        echo $vendor | grep -q "HP" && disk_num=$((slot_id+0)) || disk_num=$((slot_id+1))
+                        #pub_IdcFreeCreate  "Encl $encl_id,Slot $slot_id" "Disk Enclosure $encl_id Slot $slot_id is $disk_state, Model: $disk_model." "1" "$encl_id:$slot_id"
+                        echo -e "===================IDC===================\nSlot: Slot$slot_id\nDisk SN: $disk_sn\nVendor: $disk_manu\n\n==================Device==================\nDevice: $device_name\nDisk Lable: disk$disk_num\n\n================Error Info================\nDisk Enclosure $encl_id Slot $slot_id is $disk_state, Model: $disk_model." > $errorfileinfo 
+                        pub_IdcFreeCreate  "Slot$slot_id" "`cat $errorfileinfo`" "1" "$encl_id:$slot_id"
+                        pub_slot=""
+                        rm -f $errorfileinfo
+                        pri_idcfree=1
+                        ${CMD_SUDO} ${CMD_MEGACLI} -PdLocate -start -physdrv[$encl_id:$slot_id] -a$i -NoLog &>/dev/null #点灯
+                        echo "$encl_id:$slot_id,$i" | ${CMD_SUDO} ${CMD_TEE} -a ${pri_led} >/dev/null #点灯记录文件
+                    #else
+                    #    exitstatus=$warning
+                    #    pub_messageSend "raidpd" "[ WARNING ]" "$msg"
+                    fi
+                fi
+            fi
+
+            if [ $pri_idcfree -eq 0 ]; then
+                mederrcount=`echo $onepdlist|awk '{print $11}'` #media error大于100,即把这个盘报错
+                preerrcount=`echo $onepdlist|awk '{print $19}'` #predictive error 大于 0, 也报错
+                errcountadd=`expr $mederrcount + $preerrcount 2>/dev/null`
+                encl_id=`echo $onepdlist|awk '{print $4}'`
+                slot_id=`echo $onepdlist|awk '{print $7}'`
+                # [[ "$encl_id" == "252" && $slot_id -gt 1 ]] && slot_id=`expr $slot_id - 2` #针对华为BH620 Enclosure 252 Slot号漂移的校正
+                disk_model=`echo $onepdlist|awk -F": " '{print $NF}'`
+                if [[ -n "$slot_id" && $mederrcount -ge 100 ]]; then
+                    exitstatus=$error
+                    pub_messageAppend "Disk Enclosure $encl_id Slot $slot_id has $mederrcount Media Errors, Model: $disk_model."
+                    pub_slot="Slot$slot_id"
+                    device_name=`${CMD_HWINFO_HELP} --fields diskname,slot,serial_number,manufacturer disk | grep ":$slot_id," | awk -F"," '{print $1}'`
+                    disk_sn=`${CMD_HWINFO_HELP} --fields diskname,slot,serial_number,manufacturer disk | grep ":$slot_id," | awk -F"," '{print $3}'`
+                    disk_manu=`${CMD_HWINFO_HELP} --fields diskname,slot,serial_number,manufacturer disk | grep ":$slot_id," | awk -F"," '{print $4}'`
+                    vendor=`echo $pub_vendor | tr [a-z] [A-Z]`
+                    echo $vendor | grep -q "HP" && disk_num=$((slot_id+0)) || disk_num=$((slot_id+1))
+                    echo -e "===================IDC===================\nSlot: Slot$slot_id\nDisk SN: $disk_sn\nVendor: $disk_manu\n\n==================Device==================\nDevice: $device_name\nDisk Lable: disk$disk_num\n\n================Error Info================\nDisk Enclosure $encl_id Slot $slot_id has $mederrcount Media Errors, Model: $disk_model." > $errorfileinfo
+                    #pub_IdcFreeCreate  "Encl $encl_id,Slot $slot_id" "Disk Enclosure $encl_id Slot $slot_id has $mederrcount Media Errors, Model: $disk_model." "1" "$encl_id:$slot_id"
+                    pub_IdcFreeCreate  "Slot$slot_id" "`cat $errorfileinfo`" "1" "$encl_id:$slot_id"
+                    pub_slot=""
+                    rm -f $errorfileinfo
+                    pub_messageSend "raidpd" "[ ERROR ]" "$msg"
+                    pri_idcfree=1
+                    ${CMD_SUDO} ${CMD_MEGACLI} -PdLocate -start -physdrv[$encl_id:$slot_id] -a$i -NoLog &>/dev/null
+                    echo "$encl_id:$slot_id,$i" | ${CMD_SUDO} ${CMD_TEE} -a ${pri_led} >/dev/null
+                elif [[ -n "$slot_id" && $preerrcount -ge 1 ]]; then
+                    exitstatus=$error
+                    pub_messageAppend "Disk Enclosure $encl_id Slot $slot_id has $preerrcount Predictive Errors, Model: $disk_model."
+                    pub_slot="Slot$slot_id"
+                    device_name=`${CMD_HWINFO_HELP} --fields diskname,slot,serial_number,manufacturer disk | grep ":$slot_id," | awk -F"," '{print $1}'`
+                    disk_sn=`${CMD_HWINFO_HELP} --fields diskname,slot,serial_number,manufacturer disk | grep ":$slot_id," | awk -F"," '{print $3}'`
+                    disk_manu=`${CMD_HWINFO_HELP} --fields diskname,slot,serial_number,manufacturer disk | grep ":$slot_id," | awk -F"," '{print $4}'`
+                    vendor=`echo $pub_vendor | tr [a-z] [A-Z]`
+                    echo $vendor | grep -q "HP" && disk_num=$((slot_id+0)) || disk_num=$((slot_id+1))
+                    echo -e "===================IDC===================\nSlot: Slot$slot_id\nDisk SN: $disk_sn\nVendor: $disk_manu\n\n==================Device==================\nDevice: $device_name\nDisk Lable: disk$disk_num\n\n================Error Info================\nDisk Enclosure $encl_id Slot $slot_id has $preerrcount Predictive Errors, Model: $disk_model." > $errorfileinfo 
+                    #pub_IdcFreeCreate  "Encl $encl_id,Slot $slot_id" "Disk Enclosure $encl_id Slot $slot_id has $preerrcount Predictive Errors, Model: $disk_model." "1" "$encl_id:$slot_id"
+                    pub_IdcFreeCreate  "Slot$slot_id" "`cat $errorfileinfo`" "1" "$encl_id:$slot_id"
+                    pub_slot=""
+                    rm -f $errorfileinfo
+                    pub_messageSend "raidpd" "[ ERROR ]" "$msg"
+                    pri_idcfree=1
+                    ${CMD_SUDO} ${CMD_MEGACLI} -PdLocate -start -physdrv[$encl_id:$slot_id] -a$i -NoLog &>/dev/null
+                    echo "$encl_id:$slot_id,$i" | ${CMD_SUDO} ${CMD_TEE} -a ${pri_led} >/dev/null
+                elif [[ -n "$slot_id" && $mederrcount -gt 0 ]]; then
+                    #pub_messageAppend "Disk Enclosure $encl_id Slot $slot_id has $mederrcount Media Errors, Model: $disk_model."
+                    #pub_messageSend "raidpd" "[ WARNING ]" "$msg"
+                    if [ x"$IS_HWQC" = "x1" ]; then
+                        exitstatus=$error
+                        pub_slot="Slot$slot_id"
+                        device_name=`${CMD_HWINFO_HELP} --fields diskname,slot,serial_number,manufacturer disk | grep ":$slot_id," | awk -F"," '{print $1}'`
+                        disk_sn=`${CMD_HWINFO_HELP} --fields diskname,slot,serial_number,manufacturer disk | grep ":$slot_id," | awk -F"," '{print $3}'`
+                        disk_manu=`${CMD_HWINFO_HELP} --fields diskname,slot,serial_number,manufacturer disk | grep ":$slot_id," | awk -F"," '{print $4}'`
+                        vendor=`echo $pub_vendor | tr [a-z] [A-Z]`
+                        echo $vendor | grep -q "HP" && disk_num=$((slot_id+0)) || disk_num=$((slot_id+1))
+                        echo -e "===================IDC===================\nSlot: Slot$slot_id\nDisk SN: $disk_sn\nVendor: $disk_manu\n\n==================Device==================\nDevice: $device_name\nDisk Lable: disk$disk_num\n\n================Error Info================\nDisk Enclosure $encl_id Slot $slot_id has $mederrcount Media Errors, Model: $disk_model." > $errorfileinfo
+                        #pub_IdcFreeCreate "Encl $encl_id,Slot $slot_id" "Disk Enclosure $encl_id Slot $slot_id has $mederrcount Media Errors, Model: $disk_model." "1" "$encl_id:$slot_id"
+                        pub_IdcFreeCreate "Slot$slot_id" "`cat $errorfileinfo`" "1" "$encl_id:$slot_id"
+                        rm -f $errorfileinfo
+                        pub_slot=""
+                        pri_idcfree=1
+                    fi
+                fi
+
+            fi
+            v=`expr $v + 7`
+            u=`expr $u + 7`
+        done
+
+        if [ $pri_idcfree -eq 0 ]; then
+            local NUM_DEGRADED
+            local NUM_FAILED
+            local NUM_Critical
+            local NUM_Offline
+            local Virtualerrlog
+            local goodslot
+            #by luxue
+            local hwinfo_help_info="/dev/shm/hwinfo_help.log"
+            local hwinfo_help_allslots="/dev/shm/hwinfo_help_allslots.log"
+            local errorslots="/dev/shm/errorslots.log"
+            local hwinfo_allslots=""
+            local errorslotsinfo=""
+            #检查VD状态------------
+            NUM_DEGRADED=`cat $pri_megacli_all |grep "Degrade"|cut -d: -f2|tr -d ' '`
+            if [ -n "$NUM_DEGRADED" ]; then
+                if [ $NUM_DEGRADED -ne 0 ]; then
+                    #正在Rebuild的逻辑卷也是Degraded，无需报修
+                    if cat $pri_megacli_pd | grep -i "Firmware\ state:" | grep -qiE "Rebuild"; then
+                        NUM_DEGRADED=0
+                    fi
+                fi
+                # by luxue
+                ${CMD_HWINFO_HELP} --fields diskname,slot,manufacturer,type disk> $hwinfo_help_info
+                if [[ $? -eq 0 ]]; then
+                    cat $hwinfo_help_info | awk -F, '{print $2}' | awk -F: '{print $NF}' > $hwinfo_help_allslots
+                fi
+
+                NUM_FAILED=`cat $pri_megacli_all |grep "Failed Disks"|cut -d: -f2|tr -d ' '`
+                NUM_Critical=`cat $pri_megacli_all |grep "Critical Disks"|cut -d: -f2|tr -d ' '`
+                NUM_Offline=`cat $pri_megacli_all |grep "Offline.*:.*[0-9]"|cut -d: -f2|tr -d " "`
+                if [[ "$NUM_DEGRADED" -ne 0 || "$NUM_FAILED" -ne 0 || "$NUM_Critical" -ne 0 || "$NUM_Offline" -ne 0 ]]; then
+                    exitstatus=$error
+                    Virtualerrlog=`cat $pri_megacli_all |grep "Virtual Drives" -A6|awk '$NF!=0'|sed 's/  //g'|sed 's/ $//'|sed 's/[ ]*:[ ]*/:/'| tr '\n' ',' | sed 's/,$//'`
+                    goodslot=`cat $pri_megacli_pd|grep "Slot Number:"|awk '{print $NF}'|tr '\n' ','|sed 's/,$//'`
+                    #by luxuw
+                    if [[ -e $hwinfo_help_allslots ]]; then
+                        hwinfo_allslots=`cat $hwinfo_help_allslots`
+                        for i in $hwinfo_allslots; do
+                            echo $goodslot 2>/dev/null | grep -q $i
+                            if [[ $? -ne 0 ]]; then
+                                echo $i >> $errorslots
+                            fi
+                        done
+                    fi
+                    if [[ -e $errorslots ]]; then
+                        errorslotsinfo=`cat $errorslots`
+                        errorslotsnum=`cat $errorslots | wc -l`
+                    fi
+                    if [ -n "$errorslotsinfo" -a $errorslotsnum -lt 2 ]; then
+                        pub_slot="Slot$errorslotsinfo"
+                        pub_messageAppend "$Virtualerrlog; Disks on following slots are Online: $goodslot. Error slots: $errorslotsinfo."
+                        pub_IdcFreeCreate  "Slot$errorslotsinfo" "$Virtualerrlog; Disks on following slots are Online: $goodslot. Error slots: $errorslotsinfo." "1" #报修
+                        pub_slot=""
+                    else
+                        pub_messageAppend "$Virtualerrlog; Disks on following slots are Online: $goodslot."
+                        pub_IdcFreeCreate  "raid" "$Virtualerrlog; Disks on following slots are Online: $goodslot." "1" #报修
+                    fi
+                    #pub_messageAppend "$Virtualerrlog; Disks on following slots are Online: $goodslot."
+                    #pub_IdcFreeCreate  "raid" "$msg" "0" #报修
+                    #pub_IdcFreeCreate  "raid" "$msg" "1" #报修
+                fi
+
+                #获取逻辑盘故障
+                local pri_temp=''
+                local pri_ld=`${CMD_SUDO} ${CMD_MEGACLI} -LDInfo -Lall -a$i -NoLog 2>/dev/null|grep -E "^Virtual D|^State"|sed 's/[ \t]\{1,\}//g'`
+                local pri_ldMsg=''
+                for s in $pri_ld; do
+                    if `echo ${s}|grep -q '^VirtualD'`; then
+                        pri_temp=`echo $s|awk -F"(" '{print $1}'`
+                    elif `echo ${s}|grep -qv 'Optimal'`; then
+                        pri_ldMsg=${pri_ldMsg}" "${pri_temp},${s}
+                    fi
+                done
+                if [ -n "$pri_ldMsg" ]; then    #存在逻辑盘故障
+                    #exitstatus=$warning
+                    #pub_messageAppend "$pri_ldMsg."    #追加$pub_message
+                    #pub_messageSend "raidld" "[ WARNING ]" "$pri_ldMsg."    #发syslog
+                    echo $pri_ldMsg |grep -wq "Degraded"
+                    #if [ $? -ne 0 ]; then   #不存在Degraded的逻辑盘？？这是干嘛，还set_critical=1(原刘毅脚本580行)
+                    #    exitstatus=$critical
+                    #fi
+                fi
+            fi
+        fi
+
+        #检查电池状态
+        local pri_bbu=`cat $pri_megacli_all |grep -i ^bbu|head -n 1|awk -F: '{print $2}'|sed 's/^[ \t]//g'|sed 's/[ \t]$//g'`
+        if echo "$pri_bbu" | grep -iqE "Absent|Not present"; then
+            bbustatus=$warning
+            bbu_msg="RAID BBU status is $pri_bbu."
+            # exitstatus=$warning
+            # pub_messageAppend "RAID BBU status is $pri_bbu!"
+            #pub_messageSend "raidbbu" "[ WARNING ]" "$msg"
+        elif [ "$pri_bbu" != "Present" ] && [ ! -z "$pri_bbu" ]; then
+            local badbbustatus=`cat $pri_megacli_all|grep -i ^bbu|head -n 1|sed 's/.*:\(.*\)/\1/'`
+            exitstatus=$error
+            pub_messageAppend "RAID BBU status is $badbbustatus!"
+            pub_IdcFreeCreate  "raidbbu" "RAID BBU status is $badbbustatus!" "9" #报修
+            pub_messageSend "raidbbu" "[ ERROR ]" "$msg" #发syslog
+        else
+            ${CMD_SUDO} ${CMD_MEGACLI} -AdpBBUCmd -a$i -NoLog 2>/dev/null|grep -E "Battery Replacement required|Full Charge Capacity|Design Capacity" > $pri_megacli_bbu
+            if [ -n "$(cat $pri_megacli_bbu)" ]; then
+                local bbu_rep=0
+                cat $pri_megacli_bbu | grep "Replacement" | grep -qw "Yes" && bbu_rep=1 #电池提示自己需要更换了
+                local pri_full=`cat $pri_megacli_bbu | grep Full | head -1 | awk '{print $4}'`
+                local pri_design=`cat $pri_megacli_bbu | grep Design | head -1 | awk '{print $3}'`
+                [ $pri_design -ge 10000 ] && bbu_rep=1 #设计容量65535mAh，已经彻底不可用了
+                if [ $bbu_rep -eq 1 ]; then
+                    local badbbustatus=`cat $pri_megacli_bbu | sed 's/  //g' | sed 's/[ ]*:[ ]*/:/' | sort -u | tr '\n' ',' | sed 's/,$//'`
+                    exitstatus=$error
+                    pub_messageAppend "RAID BBU status is Failed, Design Capacity: $pri_design mAh."
+                    pub_IdcFreeCreate "raidbbu" "RAID BBU status is Failed, Design Capacity: $pri_design mAh." "9"
+                    pub_messageSend "raidbbu" "[ ERROR ]" "$msg" #发syslog
+                else
+                    local bbu_warn=0
+                    local pri_mem_size=`cat $pri_megacli_all|grep "Memory Size"|awk -F": " '{print $2}'|awk -F"MB" '{print $1}'`
+                    if [ $pri_design -eq 1900 ]; then #用于Dell PERC5，策略转变值500mAh
+                        [ $pri_full -lt 550 ] && bbu_warn=1
+                    elif [ $pri_design -lt 1000 ]; then #用于采用了NAND缓存的Dell PERC，策略转变值60mAh或90mAh
+                        [ $pri_full -lt 150 ] && bbu_warn=1
+                    elif [[ $pri_design -eq 1700 && $pri_mem_size -eq 256 ]]; then #用于Dell PERC6（256MB），策略转变值416mAh
+                        [ $pri_full -lt 500 ] && bbu_warn=1
+                    else #用于华为，策略转变值600mAh或868mAh
+                        [ $pri_full -lt 650 ] && bbu_warn=1
+                    fi
+                    #if [ $bbu_warn -eq 1 ]; then
+                        # bbustatus=$warning
+                        # bbu_msg="RAID BBU capacity is now $pri_full mAh, it has been or is going to be under threshold and leads to I/O events, report it to IDCFree manually."
+                        # exitstatus=$warning
+                    #    pub_messageAppend "RAID BBU capacity is now $pri_full mAh, it has been or is going to be under threshold and leads to I/O events."
+                        # pub_IdcFreeCreate "raidbbu" "RAID BBU capacity is now $pri_full mAh, replacement considered." "9"
+                    #    pub_messageSend "raidbbu" "[ WARNING ]" "$msg"
+                    #fi
+                fi
+            fi
+        fi
+        ${CMD_SUDO} ${CMD_MEGACLI} -LDInfo -Lall -a$i -NoLog 2>/dev/null|grep -E "Default Cache Policy|Current Cache Policy" > $pri_megacli_ld
+        local pri_ld_i
+        local pri_def_policy
+        local pri_cur_policy
+        local pri_ld_count=`grep -c "Default Cache Policy:" $pri_megacli_ld`
+        ((pri_ld_count--))
+        u=1
+        v=2
+        for pri_ld_i in `seq 0 $pri_ld_count`; do
+            pri_def_policy=`sed -n "$u"p $pri_megacli_ld|awk -F": " '{print $2}'|awk -F, '{print $1}'`
+            pri_cur_policy=`sed -n "$v"p $pri_megacli_ld|awk -F": " '{print $2}'|awk -F, '{print $1}'`
+            if [[ "$pri_def_policy" == "WriteBack" && "$pri_cur_policy" == "WriteThrough" ]]; then
+                exitstatus=$warning
+                pub_messageAppend "RAID LD Policy changed from WriteBack to WriteThrough, use megaraid.sh for more operations."
+                pub_messageSend "raidld" "[ WARNING ]" "RAID LD Policy changed from WriteBack to WriteThrough, use megaraid.sh for more operations."
+                break
+            fi
+            u=`expr $u + 2`
+            v=`expr $v + 2`
+        done
+
+        ((i++))
+    done
+    rm -f "$hwinfo_help_info" "$hwinfo_help_allslots" "$errorslots"
+}
+
+# HP SmartArry RAID Card check, TODO: use hpssacli instead.
+function pub_check_hpacucli() {
+    local pri_hpacucli_status="/dev/shm/hpacucli_status.txt.$suf"
+
+    # hpacucli sanity test
+    ${CMD_SUDO} ${CMD_HPACUCLI} version &>/dev/null || {
+        local cmd_ret=$?
+        err_msg="hpacucli exit with $cmd_ret."
+        flagstatus=$debug
+        return $flagstatus
+    }
+
+    # controller compatibility test
+
+    ${CMD_SUDO} ${CMD_HPACUCLI} 2>/dev/null ctrl all show status > $pri_hpacucli_status
+    #if cat $pri_hpacucli_status 2>/dev/null | grep -q "No controllers detected"; then
+    #    err_msg="No HP Controllers found."
+    #    pub_messageSend "raidcard" "[ WARNING ]" "$err_msg"
+    #    flagstatus=$debug
+    #    return $flagstatus
+    #fi
+    # DL185 G5 (P400 card) needs older version to detect cache correctly.
+    if cat $pri_hpacucli_status 2>/dev/null | grep -q "CACHE STATUS PROBLEM DETECTED" && echo $pub_model | grep -q "DL185 G5"; then
+        # TODO : move to install
+        ${CMD_SUDO} ${CMD_RPM} -e hpacucli --nodeps &>/dev/null
+        # FIXME: use yum instead
+        if ${CMD_WGET} ${pub_tools_server}/hpacucli-8.60-8.0.noarch.rpm ; then
+            if ! ${CMD_SUDO} ${CMD_YUM} localinstall -y /tmp/hpacucli-8.60-8.0.noarch.rpm &>/dev/null; then
+                flagstatus=$debug
+                pub_messageAppend "hpacucli-8.60-8.0.noarch.rpm installation failed."
+                pub_messageSend "debug" "[ DEBUG ]" "$msg"
+                return $flagstatus
+            fi
+        fi
+        ${CMD_SUDO} ${CMD_HPACUCLI} 2>/dev/null ctrl all show status > $pri_hpacucli_status
+    fi
+    if cat $pri_hpacucli_status 2>/dev/null | grep -q "CACHE STATUS PROBLEM DETECTED"; then
+        exitstatus=$critical
+        error_msg="Controller cache problem detected: cache module detached."
+        pub_messageAppend "$error_msg"
+        pub_messageSend "raidcard" "[ CRITICAL ]" "$error_msg"
+        pub_IdcFreeCreate "raidcard" "$error_msg" "8"
+        return $exitstatus
+    fi
+
+    # Controller, pd, ld check
+
+    local pri_pd=''
+    local pri_model
+    local pri_bbuMsg=''
+    local pri_loc
+    local ad_loc
+    local pd_loc
+    local pri_led="${pub_chkhw_logdir}/led.log"
+
+    # lights off
+    if [ -e ${pri_led} ] && [ x"`cat ${pri_led}`" != "x" ]; then
+        for pri_loc in $(cat ${pri_led}); do
+            ad_loc=$(echo "$pri_loc"|awk -F, '{print $2}')
+            pd_loc=$(echo "$pri_loc"|awk -F, '{print $1}')
+            ${CMD_SUDO} ${CMD_HPACUCLI} 2>/dev/null ctrl slot=$ad_loc physicaldrive $pd_loc modify led=off &>/dev/null
+        done
+        echo "" | ${CMD_SUDO} ${CMD_TEE} ${pri_led} &>/dev/null
+    fi
+
+    # Slots looping
+    pri_slots=`cat $pri_hpacucli_status 2>/dev/null | awk -F'Slot' '{print $2}' | awk '{print $1}'`
+    for pri_slotid in $pri_slots; do
+        ${CMD_SUDO} ${CMD_HPACUCLI} ctrl slot=${pri_slotid} show status 2>/dev/null > $pri_hpacucli_status
+        # RAID BBU check
+        pri_bbuMsg=`cat $pri_hpacucli_status 2>/dev/null|grep Battery|awk '$NF!~/OK/&&$NF!~/Recharging/ {printf ("Battery Status is %s.", $3) }'`
+        if [[ -n "$pri_bbuMsg" ]]; then
+            exitstatus=$error
+            pub_IdcFreeCreate  "raidbbu" "$pri_bbuMsg" "9"
+            pub_messageAppend "$pri_bbuMsg"
+            pub_messageSend "raidbbu" "[ ERROR ]" "$pri_bbuMsg"
+        else
+            # if RAID BBU is installed
+            pri_bbuMsg=`${CMD_SUDO} ${CMD_HPACUCLI} ctrl slot=${pri_slotid} show detail 2>/dev/null|grep "Battery/Capacitor Count"|awk '{print $NF}'|grep -E "^0$"`
+            #if [ -n "$pri_bbuMsg" ]; then
+                # exitstatus=$warning
+            #    bbustatus=$warning
+            #    if [ -z "$bbu_msg" ]; then
+            #        bbu_msg="Controller ${pri_slotid} RAID BBU not present."
+            #    else
+            #        bbu_msg="Controller ${pri_slotid} and $bbu_msg"
+            #    fi
+                # pub_messageAppend "$bbu_msg"
+            #    pub_messageSend "raidbbu" "[ WARNING ]" "$bbu_msg"
+            #fi
+        fi
+        ctrlstatus=`cat $pri_hpacucli_status 2>/dev/null | grep -i "Controller Status" | cut -d: -f2 | tr -d ' '`
+        if [ -n "$ctrlstatus" -a "$ctrlstatus" != "OK" ]; then
+            exitstatus=$critical
+            pub_messageAppend "Controller slot=${pri_slotid} Status:$ctrlstatus"
+            pub_messageSend "raidcard" "[ CRITICAL ]" "Contoller slot=${pri_slotid} Status: $ctrlstatus"
+            pub_IdcFreeCreate  "raidcard" "Controller $pri_slotid Status: $ctrlstatus" "8"
+        fi
+
+        # Physical disks looping
+        pri_idcfree=0
+        while read pri_dev_log; do
+            if [[ -n "$pri_dev_log" ]]; then
+                pri_pd=`echo $pri_dev_log|awk '{print $2}'`
+                pri_model=`${CMD_SUDO} ${CMD_HPACUCLI} ctrl slot=${pri_slotid} physicaldrive $pri_pd show detail 2>/dev/null|grep "Model:"|awk -F": " '{print $NF}'|sed 's/[ ]*$//g'|sed 's/ [ ]*/ /g'`
+                ${CMD_SUDO} ${CMD_HPACUCLI} ctrl slot=${pri_slotid} physicaldrive $pri_pd modify led=on &>/dev/null # light on
+                echo $pri_pd","${pri_slotid} | ${CMD_SUDO} ${CMD_TEE} -a ${pri_led} >/dev/null
+                #pub_slot="$pri_pd"
+                slotid=`echo $pri_pd | awk -F":" '{print $NF}'`
+                pub_slot="Slot$slotid"
+                exitstatus=$error
+                device_name=`${CMD_HWINFO_HELP} --fields diskname,slot,serial_number,manufacturer disk | grep ":$slotid," | awk -F"," '{print $1}'`
+                disk_sn=`${CMD_HWINFO_HELP} --fields diskname,slot,serial_number,manufacturer disk | grep ":$slotid," | awk -F"," '{print $3}'`
+                disk_manu=`${CMD_HWINFO_HELP} --fields diskname,slot,serial_number,manufacturer disk | grep ":$slotid," | awk -F"," '{print $4}'`
+                vendor=`echo $pub_vendor | tr [a-z] [A-Z]`
+                echo $vendor | grep -q "HP" && disk_num=$((slotid+0)) || disk_num=$((slotid+1))
+                echo -e "===================IDC===================\nSlot: Slot$slotid\nDisk SN: $disk_sn\nVendor: $disk_manu\n\n==================Device==================\nDevice: $device_name\nDisk Lable: disk$disk_num\n\n================Error Info================\n$pri_dev_log, Model: $pri_model." > $errorfileinfo
+                #pub_IdcFreeCreate "$pri_pd" "$pri_dev_log, Model: $pri_model." "1" "$pri_pd"
+                pub_IdcFreeCreate "Slot$slotid" "`cat $errorfileinfo`" "1" "$pri_pd"
+                pub_slot=""
+                rm -f $errorfileinfo
+                pub_messageAppend "$pri_dev_log, Model: $pri_model."
+                pub_messageSend "raidpd" "[ ERROR ]" "$pri_dev_log, Model: $pri_model"
+                pri_idcfree=1
+            fi
+        done < <(${CMD_SUDO} ${CMD_HPACUCLI} 2>/dev/null ctrl slot=${pri_slotid} physicaldrive all show status | grep physicaldrive | grep -vE "OK$|Rebuilding|Recovering")
+
+        # if no physical disk failed, check logical drive
+        if [ $pri_idcfree -eq 0 ]; then
+            while read pri_ldev_log; do
+                if [[ -n "$pri_ldev_log" ]]; then
+                    exitstatus=$error
+                    #pub_IdcFreeCreate "raidld" "$pri_ldev_log" "0"
+                    pub_IdcFreeCreate "raidld" "$pri_ldev_log" "1"
+                    pub_messageAppend "$pri_ldev_log"
+                    pub_messageSend "raidld" "[ ERROR ]" "$pri_ldev_log"
+                fi
+            done < <(${CMD_SUDO} ${CMD_HPACUCLI} 2>/dev/null ctrl slot=${pri_slotid} logicaldrive all show status | grep logicaldrive | grep -vE "OK$|Rebuilding|Recovering")
+        fi
+    done # end of slots looping
+}
+
+function pub_check_megaRAIDSCSI(){
+    local failedscsi=0
+    local non_optimal_arrays=0
+    local number_arrays=0
+    local pri_megarc_cfg="/dev/shm/megarc_dispcfg.txt.$suf"
+
+    ${CMD_SUDO} ${CMD_MEGARC} -AllAdpInfo | grep -q "No Adapters Found"
+    if test $? -eq 0; then
+        # TODO: skip 1850?
+        pub_smartctl_check
+        return $?
+    else
+        ${CMD_SUDO} ${CMD_MEGARC} -dispcfg -a0 > $pri_megarc_cfg 2>/dev/null &
+        cat $pri_megarc_cfg | grep -i "Logical Drive.*status" | grep -qi "OPTIMAL"
+        if test $? -ne 0; then
+            contstatus=`cat $pri_megarc_cfg | grep -i "Logical Drive.*status"|sed 's/.*Status: \(.*\)/\1/'`
+            pub_messageAppend "this host raid control is $contstatus"
+            #pub_IdcFreeCreate "raidcard" "$msg" "0" ##报修
+            pub_IdcFreeCreate "raidcard" "$msg" "1" ##报修
+            pub_messageSend "raidcard" "[ CRITICAL ]" "$msg"   #发syslog
+            exitstatus=$critical
+        else
+            raidscsilevel=`cat $pri_megarc_cfg | grep -oi "raidlevel: [0-9]*"`
+            scsidisknu=`cat $pri_megarc_cfg | grep -c "0x00000000"`
+            scsionlinenu=`cat $pri_megarc_cfg | grep -c "ONLINE"`
+            if test $scsidisknu -eq $scsionlinenu; then
+                exitstatus=$ok
+            else
+                failscsidisk=`expr $scsidisknu - $scsionlinenu`
+                failscsidisknumber=`$pri_megarc_cfg |grep "0x00000"|grep -inv "ONLINE"|awk -F: '{ print $1 }'`
+                pub_messageAppend "this host total have $scsidisknu disks,raidlevel $raidscsilevel,failed  $failscsidisk,failed disk number is $failscsidisknumber!"
+                pub_IdcFreeCreate "raid" "$msg" "1" ##报修
+                pub_messageSend "raid" "[ ERROR ]" "$msg"   #发syslog
+                exitstatus=$error
+            fi
+        fi
+    fi
+}
+
+#用cfggen检查LSI SAS1064 PCI-X等(包含物理盘/逻辑盘/电池check)  盘丢失的方法
+function pub_check_cfggen() {
+    local pri_cfggen_list_txt="/dev/shm/cfggen_list.txt.$suf"
+    local pri_cfggen_status_txt="/dev/shm/cfggen_status.txt.$suf"
+    local pri_cfggen_disp_txt="/dev/shm/cfggen_disp.txt.$suf"
+
+    ${CMD_SUDO} ${CMD_MODPROBE} mptctl &>/dev/null
+    ${CMD_SUDO} ${CMD_CFGGEN} LIST >$pri_cfggen_list_txt 2>/dev/null || {
+        local cmd_ret=$?
+        if [ $cmd_ret -eq 2 ]; then
+            pub_smartctl_check
+            return $?
+        else
+            err_msg="cfggen exit with $cmd_ret."
+            flagstatus=$debug
+            return $flagstatus
+        fi
+    }
+    local ctrl_id
+    local encl_id
+    local slot_id
+    local cfggen_error_txt
+    local good_slot
+    local lsiutil_error_txt
+    local disknm
+    local disk_state
+    local disk_model
+    local errordisk=""
+    local pri_pd
+    local i
+    local j
+    local k
+    local l
+    local h
+    local pri_loc
+    local ad_loc
+    local pd_loc
+    local vd_status
+    local pri_bad_disk
+    local pri_led="${pub_chkhw_logdir}/led.log"
+    #by luxue
+    local hwinfo_help_info="/dev/shm/hwinfo_help.log"
+    local hwinfo_help_allslots="/dev/shm/hwinfo_help_allslots.log"
+    local errorslots="/dev/shm/errorslots.log"
+    local hwinfo_allslots=""
+    local errorslotsinfo=""
+
+    if ${CMD_SUDO} ${CMD_LSPCI} 2>/dev/null | grep -qw SAS1068E; then
+        if [ $lsiutil_hang -eq 1 ]; then #cfggen在3.04版本mptsas驱动上可能导致kernel panic
+            for ctrl_id in $(cat $pri_cfggen_list_txt 2>/dev/null | awk '{print $1}' | grep "[0-9]\+"); do
+                ${CMD_SUDO} ${CMD_CFGGEN} $ctrl_id STATUS 2>/dev/null > $pri_cfggen_status_txt
+                vd_status=`cat "$pri_cfggen_status_txt" 2>/dev/null | grep -i "Volume state" | grep -viE "Optimal|Okay|Resyncing"`
+                if [ -n "$vd_status" ]; then
+                    cfggen_vd_txt=`cat "$pri_cfggen_status_txt" 2>/dev/null|grep -iE "Volume ID|Volume state"|sed 's/^[ \t]*//g'|sed 's/[ \t]*$//g'|sed 's/[ \t]*:[ \t]*/:/g'|sed 's/ /_/g'|tr '\n' ';'|sed 's/;$//'`
+                    cfggen_vd_txt="cfggen $ctrl_id STATUS: $cfggen_vd_txt"
+                    pub_messageAppend "$cfggen_vd_txt."
+                    exitstatus=$error
+                    pub_messageSend  "raidld" "[ ERROR ]" "$msg"
+                    #pub_IdcFreeCreate  "raidld" "$msg" "0"
+                    pub_IdcFreeCreate  "raidld" "$msg" "1"
+                fi
+            done
+            pub_smartctl_check
+            return $?
+        fi
+    fi
+    # lights off
+    if [ -e ${pri_led} ] && [ x"`cat ${pri_led}`" != "x" ]; then
+        for pri_loc in $(cat ${pri_led}); do
+            ad_loc=$(echo "$pri_loc"|awk -F, '{print $2}')
+            pd_loc=$(echo "$pri_loc"|awk -F, '{print $1}')
+            ${CMD_SUDO} ${CMD_CFGGEN} $ad_loc LOCATE $pd_loc off &>/dev/null
+        done
+        echo "" | ${CMD_SUDO} ${CMD_TEE} ${pri_led} &>/dev/null
+    fi
+
+    ctrl_nr=$(cat "$pri_cfggen_list_txt" 2>/dev/null | awk '{print $1}' | grep "[0-9]\+" | wc -l)
+    for ctrl_id in $(cat "$pri_cfggen_list_txt" 2>/dev/null | awk '{print $1}' | grep "[0-9]\+") ; do
+        local n=0
+        pri_bad_disk=0
+        ${CMD_SUDO} ${CMD_CFGGEN} $ctrl_id DISPLAY >$pri_cfggen_disp_txt 2>/dev/null
+        [ $? -ne 0 ] && pri_bad_disk=1 #cfggen遇到坏盘时会超时退出，假如cfggen退出状态非0，则有坏盘，还需进一步检查
+        disknm=$(cat $pri_cfggen_disp_txt 2>/dev/null|grep "Device is a Hard disk"|wc -l)
+        for ((i=1; i<="$disknm"; i++)); do
+            j=`expr $i \* 6`
+            l=`expr $j - 5`
+            cat $pri_cfggen_disp_txt 2>/dev/null|sed -n '/Device is a Hard disk/{N;N;N;N;N;p}'|sed -n "$l,$j"p|grep State|egrep -iq "Online|Ready|Standby|Optimal|HSP|OSY"
+            if [ $? != 0 ]; then
+                k=`expr $j - 4`
+                h=`expr $j - 3`
+                encl_id=`cat $pri_cfggen_disp_txt |sed -n '/Device is a Hard disk/{N;N;N;N;N;p}'|sed -n "$k"p|awk -F": " '{print $NF}'| grep '[0-9]\+'`
+                slot_id=`cat $pri_cfggen_disp_txt |sed -n '/Device is a Hard disk/{N;N;N;N;N;p}'|sed -n "$h"p|awk -F": " '{print $NF}'| grep '[0-9]\+'`
+                disk_state=`cat $pri_cfggen_disp_txt |sed -n '/Device is a Hard disk/{N;N;N;N;N;p}'|sed -n "$l,$j"p|grep State|awk -F": " '{print $NF}'`
+                [ -z "$disk_state" ] && continue
+                k=`expr $j + 2`
+                h=`expr $j + 3`
+                disk_model=`cat $pri_cfggen_disp_txt |sed -n '/Device is a Hard disk/{N;N;N;N;N;N;N;N;p}'|sed -n "$k,$h"p|awk -F": " '{print $NF}'|sed 's/[ ]*$//g'|tr "\n" " "|sed 's/[ ]*$//g'`
+                ${CMD_SUDO} ${CMD_CFGGEN} $ctrl_id LOCATE $encl_id":"$slot_id on &>/dev/null  #点灯
+                echo $encl_id":"$slot_id","$ctrl_id | ${CMD_SUDO} ${CMD_TEE} -a ${pri_led} >/dev/null  #写点灯标记文件
+                ((n++))
+                exitstatus=$error
+                pub_messageAppend "Disk Enclosure $encl_id Slot $slot_id is $disk_state, Model: $disk_model."
+                pub_messageSend "raidpd" "[ ERROR ]" "$msg"
+                errordisk="Ctrl $ctrl_id,Encl ${encl_id},Slot ${slot_id}"
+                [ "$ctrl_nr" -eq 1 ] && pub_slot="Slot${slot_id}" || pub_slot="$errordisk"
+                device_name=`${CMD_HWINFO_HELP} --fields diskname,slot,serial_number,manufacturer disk | grep ":$slot_id," | awk -F"," '{print $1}'`
+                disk_sn=`${CMD_HWINFO_HELP} --fields diskname,slot,serial_number,manufacturer disk | grep ":$slot_id," | awk -F"," '{print $3}'`
+                disk_manu=`${CMD_HWINFO_HELP} --fields diskname,slot,serial_number,manufacturer disk | grep ":$slot_id," | awk -F"," '{print $4}'`
+                vendor=`echo $pub_vendor | tr [a-z] [A-Z]`
+                echo $vendor | grep -q "HP" && disk_num=$((slot_id+0)) || disk_num=$((slot_id+1))
+                echo -e "===================IDC===================\nSlot: Slot$slot_id\nDisk SN: $disk_sn\nVendor: $disk_manu\n\n==================Device==================\nDevice: $device_name\nDisk Lable: disk$disk_num\n\n================Error Info================\nDisk Enclosure $encl_id Slot $slot_id is $disk_state, Model: $disk_model." > $errorfileinfo 
+                #pub_IdcFreeCreate "$errordisk" "Disk Enclosure $encl_id Slot $slot_id is $disk_state, Model: $disk_model." "1" "$ctrl_id:$encl_id:$slot_id"
+                pub_IdcFreeCreate "Slot$slot_id" "`cat $errorfileinfo`" "1" "$ctrl_id:$encl_id:$slot_id"
+                pub_slot=""
+                rm -f $errorfileinfo
+            fi
+        done
+
+        if [ $pri_bad_disk -eq 1 ]; then #假如cfggen遇到超时退出，使用lsiutil进一步检查
+            local pri_port=`expr $ctrl_id + 1`
+            if [ -x ${CMD_LSIUTIL} ]; then
+                lsiutil_error_txt=`${CMD_SUDO} ${CMD_LSIUTIL} -p $pri_port -a 8,0 2>/dev/null | grep "ScsiIo to" | grep failed | tail -1`
+                if [ -n "$lsiutil_error_txt" ]; then
+                    ((n++))
+                    errordisk=`echo "$lsiutil_error_txt"|awk -F" failed," '{print $1}'|awk -F"to " '{print $2}'`
+                    local lsi_error_log=`echo "$lsiutil_error_txt"|awk -F, '{print $1}'`
+                    exitstatus=$error
+                    pub_messageAppend "${lsi_error_log}!"
+                    pub_messageSend "raidpd" "[ ERROR ]" "$lsiutil_error_txt"
+                    pub_IdcFreeCreate "$errordisk" "$lsiutil_error_txt" "1" #报修
+                fi
+            fi
+            #if [ -z "$lsiutil_error_txt" ]; then #警告存在未知坏盘
+            #    pub_messageAppend "cfggen check timed out, there is some unknown hard disk error."
+            #    pub_messageSend "raidpd" "[ WARNING ]" "$msg"
+                # pub_IdcFreeCreate "unknown" "$msg" "1" #报修未知磁盘错误
+            #fi
+        fi
+        if [ $n -eq 0 ]; then
+            cfggen_vd_txt=`cat $pri_cfggen_disp_txt|grep -i "Status of volume"|grep -Ev "Optimal|Okay|Resyncing"`
+            if [ -n "$cfggen_vd_txt" ]; then
+                #by luxue
+                ${CMD_HWINFO_HELP} --fields diskname,slot,manufacturer,type disk > $hwinfo_help_info
+                if [[ $? -eq 0 ]]; then
+                    cat $hwinfo_help_info | awk -F, '{print $2}' | awk -F: '{print $NF}' > $hwinfo_help_allslots
+                fi
+
+                exitstatus=$error
+                cfggen_error_txt=`cat $pri_cfggen_disp_txt |grep -E 'Volume ID|Status of volume|Physical hard disks'| sed 's/^[ \t]*//g'  | sed 's/[ \t]*$//g'| sed 's/[ \t]*:[ \t]*/:/g' | sed 's/ /_/g' | tr '\n' ';' | sed 's/;$//'`
+                good_slot=`cat $pri_cfggen_disp_txt|grep "Device is a Hard disk" -A2|grep "Slot #"|awk -F": " '{print $2}'|tr "\n" ","|sed 's/,$//'`
+                #by luxue
+                if [[ -e $hwinfo_help_allslots ]]; then
+                    hwinfo_allslots=`cat $hwinfo_help_allslots`
+                    for i in $hwinfo_allslots; do
+                        echo $goodslot 2>/dev/null | grep -q $i
+                        if [[ $? -ne 0 ]]; then
+                            echo $i >> $errorslots
+                        fi
+                    done
+                fi
+                if [[ -e $errorslots ]]; then
+                    errorslotsinfo=`cat $errorslots`
+                    errorslotsnum=`cat errorslots | wc -l`
+                fi
+                if [ -n "$errorslotsinfo" -a $errorslotsnum -lt 2 ]; then
+                    cfggen_error_txt="$cfggen_error_txt, Disks on following slots are Online: $good_slot. Error slots: $errorslotsinfo."
+                    pub_messageAppend "$cfggen_error_txt"
+                    pub_messageSend "raidld" "[ ERROR ]" "$msg"
+                    pub_IdcFreeCreate "Slot$errorslotsinfo" "$cfggen_error_txt" "1" #报修
+                else
+                    cfggen_error_txt="$cfggen_error_txt, Disks on following slots are Online: $good_slot."
+                    pub_messageAppend "$cfggen_error_txt"
+                    pub_messageSend "raidld" "[ ERROR ]" "$msg"
+                    pub_IdcFreeCreate "raidld" "$cfggen_error_txt" "1" #报修
+                fi
+                #cfggen_error_txt="$cfggen_error_txt, Disks on following slots are Online: $good_slot."
+                #pub_messageAppend "$cfggen_error_txt"
+                #pub_messageSend "raidld" "[ ERROR ]" "$msg"
+                #pub_IdcFreeCreate "raidld" "$cfggen_error_txt" "0" #报修
+                #pub_IdcFreeCreate "raidld" "$cfggen_error_txt" "1" #报修
+            fi
+        fi
+    done
+    rm -f "$hwinfo_help_info" "$hwinfo_help_allslots" "$errorslots"
+    pub_smartctl_check
+}
+
+function pub_check_arcconf(){
+    local pri_cmd=''
+    local pri_arcconf_getversion="/dev/shm/arcconf_getversion.txt.$suf"
+    local pri_arcconf_getconfig="/dev/shm/arcconf_getconfig.txt.$suf"
+
+    [ -f ${CMD_ARCCONF} ] && pri_cmd="${CMD_ARCCONF}"
+    [ -f ${CMD_ARCCONF_SUN} ] && pri_cmd="${CMD_ARCCONF_SUN}"   #aliyun Sun服务器的
+    ${CMD_SUDO} $pri_cmd GETVERSION >$pri_arcconf_getversion 2>/dev/null || {
+        local cmd_ret=$?
+        err_msg="arcconf exit with $cmd_ret."
+        flagstatus=$debug
+        return $flagstatus
+    }
+    local pri_adpCount=`cat $pri_arcconf_getversion|grep "Controllers found:"|awk -F": " '{print $2}'`
+    for i in `seq 1 $pri_adpCount`; do
+        ${CMD_SUDO} $pri_cmd GETCONFIG $i > $pri_arcconf_getconfig
+        local pri_temp0=''
+        local pri_temp1=''
+        local pri_temp2=''
+        #获取故障磁盘列表
+        local pri_pd=`cat $pri_arcconf_getconfig|grep -E "Device #|State"|sed 's/[ \t#]\{1,\}//g'`
+        local pri_pdMsg=''
+        local pri_model
+        local pri_pdModel
+        for s in $pri_pd; do
+            if `echo ${s}|grep -q Device`; then
+                pri_temp0=$s
+            elif `echo ${s}|grep -qvE 'Online|Spare|Ready|Charging'`; then
+                pri_pdMsg="${pri_pdMsg}${pri_temp0},${s} "
+                pri_temp2=`echo $pri_temp0|awk -F"Device" '{print $2}'`
+                pri_model=`cat $pri_arcconf_getconfig|grep -A 7 "Device #${pri_temp2}"|sed -n '7,8p'|awk -F": " '{print $NF}'|sed 's/[ ]*$//g'|tr "\n" " "|sed 's/[ ]*$//g'`
+                pri_pdModel="${pri_pdModel}${pri_model} "
+            fi
+        done
+
+        #设置强制写Cache
+        # local pri_ld_count=`cat $pri_arcconf_getconfig|grep "Logical drive number" -c`
+        # local pri_ld_i
+        # for pri_ld_i in `seq 1 $pri_ld_count`; do
+            # ${CMD_SUDO} $pri_cmd setcache $i logicaldrive $pri_ld_i wb noprompt &>/dev/null
+        # done
+
+        #获取故障卷列表
+        pri_temp0=''
+        local pri_ld=`cat $pri_arcconf_getconfig|grep -E 'Logical drive number|Status of logical drive'|sed 's/[ \t]\{1,\}//g'`
+        local pri_ldMsg=''
+        for s in $pri_ld; do
+            if `echo ${s}|grep -q '^Logical'`; then
+                pri_temp0=`echo $s|awk -F"number" '{print $NF}'`
+            elif `echo ${s}|grep -qvE 'Okay|Optimal'`; then
+                pri_temp1=`echo ${s}|awk -F: '{print $NF}'`
+                pri_ldMsg="${pri_ldMsg}Raid${pri_temp0},${s} "
+            fi
+        done
+
+        #获取故障电池信息
+        local pri_bbu=`cat $pri_arcconf_getconfig|grep -A 2 "Controller Battery Information"|tail -1|awk -F": " '{print $NF}'`
+        local pri_bbuMsg=''
+        if [ "$pri_bbu" == "Not Installed" ]; then
+            bbu_msg="RAID BBU Not Installed."
+        elif [[ -n "$pri_bbu" && "$pri_bbu" != "Optimal" && "$pri_bbu" != "Charging" && "$pri_bbu" != "Okay" ]]; then
+            pri_bbuMsg="Battery,status:$pri_bbu"
+        fi
+
+        #获取卡故障信息
+        local pri_adp=`cat $pri_arcconf_getconfig|grep "Controller Status"|head -1|awk '{print $NF}'|tr -d ''`
+        local pri_adpMsg=''
+        if [[ "$pri_adp" != "Okay" && "$pri_adp" != "Optimal" ]]; then
+            pri_adpMsg="Controller,status:$pri_adp"
+        fi
+
+        #故障处理
+        local pri_deviceNumber=''
+        if [ -n "$pri_pdMsg" ]; then  #有物理盘故障
+            pri_deviceNumber=`echo "$pri_pdMsg"|awk -F, '{print $1}'`
+            pub_slot="$pri_deviceNumber"
+            pub_IdcFreeCreate "$pri_deviceNumber" "$pri_pdMsg, Model: $pri_pdModel." "1"  ##报修
+            pub_slot=""
+            pub_messageAppend "$pri_pdMsg, Model: $pri_pdModel."  #追加$pub_message
+            pub_messageSend "raidpd" "[ ERROR ]" "$msg" #发syslog
+            exitstatus=$error
+        elif [ -n "$pri_ldMsg" ]; then    #无物理盘故障单有逻辑盘故障
+            pub_IdcFreeCreate "raidld" "$pri_ldMsg." "1"  ##报修
+            pub_messageAppend "$pri_ldMsg."  #追加$pub_message
+            pub_messageSend "raidld" "[ ERROR ]" "$pri_ldMsg." #发syslog
+            exitstatus=$error
+        fi
+        if [ -n "$pri_bbuMsg" ]; then
+            pub_messageAppend "$pri_bbuMsg."  #追加$pub_message
+            pub_messageSend "raidbbu" "[ ERROR ]" "$pri_bbuMsg." #发syslog
+            pub_IdcFreeCreate "raidbbu" "$pri_bbuMsg." "9" #报修电池
+            exitstatus=$error
+        fi
+        if [ -n "$pri_adpMsg" ]; then
+            pub_messageAppend "$pri_adpMsg."  #追加$pub_message
+            pub_messageSend "raidcard" "[ CRITICAL ]" "$pri_adpMsg." #发syslog
+            pub_IdcFreeCreate "raidcard" "$pri_adpMsg." "8" #报修卡
+            exitstatus=$critical
+        fi
+    done
+}
+
+pub_check_mpt2SAS() {
+    local pri_sas2ircu_list_txt="/dev/shm/sas2ircu_list.txt.$suf"
+    local pri_sas2ircu_disp_txt="/dev/shm/sas2ircu_disp.txt.$suf"
+    
+    # sas2ircu causes kernel hang on ECS NC hosts, disable it
+    # by Caspar Zhang
+    if pub_is_ecs_host; then
+        return
+    fi
+
+    pub_sas2ircu_timeout
+    if [ $? -eq 127 ]; then
+        pub_messageAppend "sas2ircu timeout, some disk might be failed."
+        pub_messageSend "raidcard" "[ CRITICAL ]" "sas2ircu timeout, some disk might be failed."
+        #pub_IdcFreeCreate "raidcard" "$pri_adpMsg." "8" #报修卡
+        exitstatus=$critical
+        return $exitstatus
+    fi
+
+    ${CMD_SUDO} ${CMD_SAS2IRCU} LIST >$pri_sas2ircu_list_txt 2>/dev/null || {
+        local cmd_ret=$?
+        if [ $cmd_ret -eq 1 ]; then
+            pub_check_cfggen
+            return $?
+        else
+            err_msg="sas2ircu exit with $cmd_ret."
+            flagstatus=$debug
+            return $flagstatus
+        fi
+    }
+
+    local ctrl_id
+    local encl_id
+    local slot_id
+    local sas2ircu_error_txt
+    local disknm
+    local hba_num
+    local disk_state
+    local disk_model
+    local errordisk=""
+    local pri_pd
+    local i
+    local j
+    local k
+    local h
+    local pri_loc
+    local ad_loc
+    local pd_loc
+    local pri_led="${pub_chkhw_logdir}/led.log"
+
+    # lights off
+    if [ -e ${pri_led} ] && [ x"`cat ${pri_led}`" != "x" ]; then
+        for pri_loc in $(cat ${pri_led}); do
+            ad_loc=$(echo "$pri_loc"|awk -F, '{print $2}')
+            pd_loc=$(echo "$pri_loc"|awk -F, '{print $1}')
+            ${CMD_SUDO} ${CMD_SAS2IRCU} $ad_loc LOCATE $pd_loc off &>/dev/null  #灭灯
+        done
+        echo "" | ${CMD_SUDO} ${CMD_TEE} ${pri_led} &>/dev/null
+    fi
+
+    for ctrl_id in $(cat $pri_sas2ircu_list_txt 2>/dev/null| awk '{print $1}' | grep '[0-9]'|grep -v SAS2IRCU); do
+        local n=0
+        device_name=""
+        errorfileinfo="/dev/shm/errorinfo.log"
+        ${CMD_SUDO} ${CMD_SAS2IRCU} $ctrl_id DISPLAY >$pri_sas2ircu_disp_txt 2>/dev/null
+
+        # 报修 disk_state 错误
+        disknm=$(cat $pri_sas2ircu_disp_txt | grep "Device is a Hard disk" | wc -l)
+        for ((i=1; i<="$disknm"; i++)); do
+            j=`expr $i \* 5`
+            # 输出截成每个Disk条目5行
+            # j: 第i块盘的State字段     (j = i * 5)
+            # k: 第i块盘的Enclosure字段 (k = i * 5 - 3)
+            # h: 第i块盘的Slot字段      (h = i * 5 - 2)
+            cat $pri_sas2ircu_disp_txt | sed -n '/Device is a Hard disk/{N;N;N;N;p}' | sed -n "$j"p | egrep -iq "Online|Ready|Standby|Optimal|Rebuilding|Hot Spare"
+            if [ $? != 0 ] ;then
+                k=`expr $j - 3`
+                h=`expr $j - 2`
+                encl_id=`cat $pri_sas2ircu_disp_txt|sed -n '/Device is a Hard disk/{N;N;N;N;p}'|sed -n "$k"p|awk -F": " '{print $NF}'| grep '[0-9]*'`
+                slot_id=`cat $pri_sas2ircu_disp_txt|sed -n '/Device is a Hard disk/{N;N;N;N;p}'|sed -n "$h"p|awk -F": " '{print $NF}'| grep '[0-9]*'`
+                disk_state=`cat $pri_sas2ircu_disp_txt |sed -n '/Device is a Hard disk/{N;N;N;N;p}'|sed -n "$j"p|awk -F": " '{print $NF}'`
+                [ -z "$disk_state" ] && continue
+                # 输出截成每个Disk条目7行
+                # k: 第i块盘的Manufacturer
+                # h: 第i块盘的Model
+                k=`expr $j + 2`
+                h=`expr $j + 3`
+                disk_model=`cat $pri_sas2ircu_disp_txt|sed -n '/Device is a Hard disk/{N;N;N;N;N;N;N;p}'|sed -n "$k,$h"p|awk -F": " '{print $NF}'|sed 's/[ ]*$//g'|tr "\n" " "|sed 's/[ ]*$//g'`
+                h=`expr $j + 5`
+                disk_manu=`cat $pri_sas2ircu_disp_txt|sed -n '/Device is a Hard disk/{N;N;N;N;N;N;N;N;p}'|sed -n "$k"p|awk -F": " '{print $NF}'|sed 's/[ ]*$//g'|tr "\n" " "|sed 's/[ ]*$//g'`
+                disk_sn=`cat $pri_sas2ircu_disp_txt|sed -n '/Device is a Hard disk/{N;N;N;N;N;N;N;N;N;N;p}'|sed -n "$h"p|awk -F": " '{print $NF}'|sed 's/[ ]*$//g'|tr "\n" " "|sed 's/[ ]*$//g'`
+                # 尝试点灯
+                ${CMD_SUDO} ${CMD_SAS2IRCU} $ctrl_id LOCATE $encl_id":"$slot_id on &>/dev/null
+                echo $encl_id":"$slot_id","$ctrl_id | ${CMD_SUDO} ${CMD_TEE} -a ${pri_led} >/dev/null
+                ((n++))
+
+                # 状态报修
+                exitstatus=$error
+                pub_messageAppend "Disk Enclosure $encl_id Slot $slot_id is $disk_state, Model: $disk_model."
+                pub_messageSend "raidpd" "[ ERROR ]" "$msg"
+                errordisk="Encl ${encl_id},Slot ${slot_id}"
+                pub_slot="Slot${slot_id}"
+                device_name=`${CMD_HWINFO_HELP} --fields diskname,serial_number disk | grep "$disk_sn" | awk -F"," '{print $1}'`
+                #echo $pub_model | grep -q "DL380e Gen8" && disk_num=$((slot_id+0)) || disk_num=$((slot_id+1))
+                vendor=`echo $pub_vendor | tr [a-z] [A-Z]`
+                echo $vendor | grep -q "HP" && disk_num=$((slot_id+0)) || disk_num=$((slot_id+1))
+                echo -e "===================IDC===================\nSlot: Slot$slot_id\nDisk SN: $disk_sn\nVendor: $disk_manu\n\n==================Device==================\nDevice: $device_name\nDisk Lable: disk$disk_num\n\n================Error Info================\nDisk Enclosure $encl_id Slot $slot_id is $disk_state, Model: $disk_model." > $errorfileinfo
+                #pub_IdcFreeCreate "$errordisk" "Disk Enclosure $encl_id Slot $slot_id is $disk_state, Model: $disk_model." "1" "$ctrl_id:$encl_id:$slot_id"
+                pub_IdcFreeCreate "Slot$slot_id" "`cat $errorfileinfo`" "1" "$ctrl_id:$encl_id:$slot_id"
+                pub_slot=""
+                rm -f $errorfileinfo
+            fi
+        done
+
+        # 如果当前Controller无volume，检查volume状态
+        if [ $n -eq 0 ]; then
+            sas2ircu_vd_txt=`cat $pri_sas2ircu_disp_txt 2>/dev/null|grep -i "Status of volume"|grep -Ev "Optimal|Okay|Resyncing"`
+            if [ -n "$sas2ircu_vd_txt" ]; then
+                # 报修不正常volume状态
+                exitstatus=$error
+                sas2ircu_error_txt=`cat $pri_sas2ircu_disp_txt|grep -E 'Volume ID|Status of volume|PHY'|sed 's/Enclosure#\/Slot#//g'|sed 's/^[ \t]*//g'|sed 's/[ \t]*$//g'|sed 's/[ \t]*:[ \t]*/:/g'| sed 's/ /_/g'|tr '\n' ';'|sed 's/;$/./'`
+                pub_messageAppend "$sas2ircu_error_txt"
+                pub_messageSend "raidld" "[ ERROR ]" "$msg"
+                #pub_IdcFreeCreate "raidld" "$sas2ircu_error_txt" "0" #报修
+                pub_IdcFreeCreate "raidld" "$sas2ircu_error_txt" "1" #报修
+            fi
+        fi
+    done
+
+    hba_num=$(cat $pri_sas2ircu_list_txt| awk '{ print $1 }'|grep -E "^[0-9]+$"|wc -l)
+    if [ x"$IS_RAMOS" = x"YES" ] && [ "$hba_num" -eq 1 ]; then
+        encl_id=$(cat "$pri_sas2ircu_disp_txt" 2>/dev/null | grep -A 11 "Device is a Enclosure services device" | grep "Enclosure #" | awk '{ print $NF }')
+        disknm=$(cat "$pri_sas2ircu_disp_txt" 2>/dev/null | grep 'Device is a Hard disk'|wc -l)
+
+        # a) 12盘单Controller缺1盘;
+        # 我们没有11块盘的系统，出现这种情况就说明丢盘了，但是
+        # 只有当磁盘已在mount列表中消失，即同样只有11块盘挂在mount列表上才报修
+        # 因为磁盘还存在于mount列表中时，get_system_hardware_syslog的setrw逻辑
+        # 已经作了相应报修。
+        # FIXME: 如果在本脚本执行前一个小时内，磁盘从mount列表消失了，那么
+        # 两个脚本都不会执行
+        #
+        # b) S9机型缺多少盘报多少盘
+        if echo "$pub_alitype" | grep -E "S9|S10" | grep -vq "13H" && [ "$disknm" -gt 0 ]; then
+            # HP Gen8 ServBP 的Slot从#1开始
+            if grep -A 11 "Device is a Enclosure" ${pri_sas2ircu_disp_txt} | grep -q "Model.*Gen8 ServBP"; then
+                start_slot=1
+                tail_msg="HP Gen8 ServBP, slot # starts from #1! SA please help to confirm the slot."
+            else
+                start_slot=0
+                tail_msg="SA please help to confirm the slot."
+            fi
+            hint_msg="Please try re-plugging the disk FIRST before asking Vendor for new disk as replacement."
+            for slot_id in `seq 0 11`; do
+                real_slot=$((slot_id + start_slot))
+                cat ${pri_sas2ircu_disp_txt} | grep "Device is a Hard disk" -A 12 | grep "Slot #" | grep -q ": $real_slot$"
+                if [ $? -ne 0 ]; then
+                    case $slot_id in
+                        0)
+                            disk_seq=1st
+                            ;;
+                        1)
+                            disk_seq=2nd
+                            ;;
+                        2)
+                            disk_seq=3rd
+                            ;;
+                        *)
+                            disk_seq=$((slot_id+1))th
+                            ;;
+                    esac
+
+                    # 尝试点灯
+                    $pri_cmd 0 LOCATE $encl_id":"$slot_id on &>/dev/null
+                    echo $encl_id":"$slot_id",0" | ${CMD_SUDO} ${CMD_TEE} -a ${pri_led} >/dev/null
+                    errordisk=`echo "Slot${real_slot}" | sed 's/ //g'`
+                    pub_messageAppend "SAS2IRCU reports that disk in ${errordisk} (the $disk_seq disk) is missing or dead!"
+                    pub_messageSend "raidpd" "[ ERROR ]" "$msg"
+                    pub_slot="$errordisk"
+                    device_name=`${CMD_HWINFO_HELP} --fields diskname,slot,serial_number,manufacturer disk | grep ":$real_slot," | awk -F"," '{print $1}'`
+                    disk_sn=`${CMD_HWINFO_HELP} --fields diskname,slot,serial_number,manufacturer disk |grep ":$real_slot," | awk -F"," '{print $3}'`
+                    disk_manu=`${CMD_HWINFO_HELP} --fields diskname,slot,serial_number,manufacturer disk | grep ":$real_slot," | awk -F"," '{print $4}'`
+                    disk_num=`echo $disk_seq | sed 's/[a-z]\|[A-Z]//g'`
+                    echo -e "===================IDC===================\nSlot: $errordisk\nDisk SN: $disk_sn\nVendor: $disk_manu\n\n==================Device==================\nDevice: $device_name\nDisk Lable: disk$disk_num\n\n================Error Info================\nSAS2IRCU reports that disk in ${errordisk} (the $disk_seq disk) is missing or dead!" > $errorfileinfo 
+                    #pub_IdcFreeCreate "${errordisk}" "SAS2IRCU reports that disk in ${errordisk} (the $disk_seq disk) is missing or dead! $hint_msg $tail_msg" "1" "0:$encl_id:$slot_id"
+                    pub_IdcFreeCreate "${errordisk}" "`cat $errorfileinfo`" "1" "0:$encl_id:$slot_id"
+                    pub_slot=""
+                    exitstatus=$error
+                    rm -f $errorfileinfo
+                fi
+            done
+        elif echo "$pub_alitype" | grep -E "S9|S10" | grep -vq "13H" && [ "${disknm}" -eq 0 ]; then            
+            pub_messageAppend "SAS2IRCU reports no disk existed, please check the enclosure!"
+            pub_messageSend "raidpd" "[ ERROR ]" "$msg"
+            echo -e "===================IDC===================\nSlot: All slots\nDisk SN:\nVendor:\n\n==================Device==================\nDevice:\nDisk Lable:\n\n================Error Info================\nSAS2IRCU reports that no disk existed, please check the enclosure." > $errorfileinfo
+            pub_IdcFreeCreate "no_disk" "`cat $errorfileinfo`" "1" #报修
+            exitstatus=$error
+            rm -f $errorfileinfo
+        fi
+    fi
+}
+
+function pub_smartctl_check() {
+    [ -x ${CMD_SMARTCTL} ] || {
+        err_msg="pub_smartctl_check need smartctl package."
+        pub_messageSend "debug" "[ DEBUG ]" "pub_smartctl_check need smartctl package."
+        flagstatus=$debug
+        return $flagstatus
+    }
+    local diskname
+    local t
+    local i
+    local pri_slot
+    local pri_model
+    local pri_vendor
+    [ "$pub_mdstat_fail" == "1" ] && return #报修软RAID故障后跳过smartctl检查
+    diskname=`awk '{print $NF}' /proc/partitions |egrep -i "^sd|^cciss"|grep -v "p[0-9]\+"|grep -vE "^s.+[0-9]+"`
+    for t in $diskname; do
+        ${CMD_SUDO} ${CMD_SMARTCTL} -H /dev/$t|egrep -iq "not an ATA/ATAPI device|Input/output error|Log Sense failed|No such device or address"
+        if test $? -ne 0; then
+            ${CMD_SUDO} ${CMD_SMARTCTL} -H /dev/$t|egrep -iq "ok|PASSED"
+            if test $? -ne 0; then
+                if ${CMD_SUDO} ${CMD_SMARTCTL} -H /dev/$t|egrep -iq "megaraid"; then #如果是megaraid磁盘（用于Dell 2850）
+                    local inquiry=1
+                    for i in `seq 1 24`; do
+                        ${CMD_SUDO} ${CMD_SMARTCTL} -H /dev/$t -d megaraid,$i|egrep -iq "INQUIRY" && break #该RAID中已经不存在第$i块盘了
+                        ${CMD_SUDO} ${CMD_SMARTCTL} -H /dev/$t -d megaraid,$i|egrep -iq "ok|PASSED"
+                        if [ $? -ne 0 ]; then
+                            pri_model=`${CMD_SUDO} ${CMD_SMARTCTL} -a /dev/$t -d megaraid,$i|egrep "Device Model:|Product:"|head -1|awk -F: '{print $2}'|sed 's/^[ ]*//g'|sed 's/[ ]*$//g'`
+                            pri_vendor=`${CMD_SUDO} ${CMD_SMARTCTL} -a /dev/$t -d megaraid,$i|egrep "Vendor:|Model Family:"|head -1|awk -F: '{print $2}'|sed 's/^[ ]*//g'|sed 's/[ ]*$//g'`
+                            #exitstatus=$warning
+                            #pub_messageAppend "smartctl check megaraid $t disk $i failed, disk model: $pri_vendor $pri_model."
+                            #pub_messageSend  "disk" "[ WARNING ]" "$msg"
+                            #pub_IdcFreeCreate  "/dev/$t disk $i" "megaraid $t disk $i smartctl check failed, disk model: $pri_vendor $pri_model." "1" #报修
+                        fi
+                    done
+                else
+                    #exitstatus=$warning
+                    #pri_slot=$(pub_disk_slot $t)
+                    pri_model=`${CMD_SUDO} ${CMD_SMARTCTL} -a /dev/$t|egrep "Device Model:|Product:"|head -1|awk -F: '{print $2}'|sed 's/^[ ]*//g'|sed 's/[ ]*$//g'`
+                    pri_vendor=`${CMD_SUDO} ${CMD_SMARTCTL} -a /dev/$t|egrep "Vendor:|Model Family:"|head -1|awk -F: '{print $2}'|sed 's/^[ ]*//g'|sed 's/[ ]*$//g'`
+                    #pub_messageAppend "smartctl check disk $t failed, disk model: $pri_vendor $pri_model."
+                    #pub_messageSend  "disk" "[ WARNING]" "$msg"
+                    #pub_IdcFreeCreate "/dev/$t" "disk $t ($pri_slot) smartctl check failed, disk model: $pri_vendor $pri_model." "1" #报修
+                fi
+                #continue
+            fi
+        #else
+        #    pub_messageSend  "disk" "[ DEBUG ]" "smartctl: Device /dev/$t Read Identity Failed"
+        fi
+    done
+}
+
+#main函数------------------------------------------
+
+pub_main(){
+    os_type=`uname -s`
+    if test "$os_type" = "Linux"; then
+        pub_check_root
+        pub_lock
+        pub_basetool
+        pub_isVirtualHost
+        pub_raid_type
+        pub_firstrun
+        pub_tools_install
+        pub_check_memoryHealth
+        #pub_check_nic
+        if ! pub_has_huatuo; then
+            pub_check_mdstat
+            pub_check_std_disks
+            if test "$raidtype" = "megaRAIDSAS"; then
+                pub_checkmegasas
+            elif test "$raidtype" = "hpraid"; then
+                pub_check_hpacucli
+            elif test $raidtype = "megaRAIDSCSI"; then
+                pub_check_megaRAIDSCSI
+            elif test $raidtype = "mptSAS"; then
+                pub_check_cfggen
+            elif test $raidtype = "aacraid"; then
+                pub_check_arcconf
+            elif test $raidtype = "mpt2SAS"; then
+                pub_check_mpt2SAS
+            elif test $raidtype = "unknown"; then
+                pub_smartctl_check
+            fi
+        fi
+        pub_motdEdit
+        pub_logfileAppend "$err_msg"
+        pub_logfileAppend "$msg"
+        pub_json_output
+        pub_exit
+    fi
+}
+pub_main

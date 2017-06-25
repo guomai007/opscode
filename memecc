@@ -1,0 +1,177 @@
+#!/usr/bin/env /home/tops/bin/python
+# -*- coding: utf-8 -*-
+# sekong.wsm@alibaba-inc.com
+'''
+memecc: monitor ecc count for every rank
+GetWaitingCpuProc: cal process waiting for cpu
+Pi: the time for calculate pi
+'''
+
+import sys
+import copy
+import os
+import time
+import pickle
+
+CpuDominMap = {
+    "CPU0": "7f",
+    "CPU1": "ff"
+}
+
+Device = "10"
+
+ChFuncMap = {
+    "CH0": "6",
+    "CH1": "7",
+    "CH2": "2",
+    "CH3": "3"
+}
+
+
+DimmRankMap = {
+    "DIMM0": [0, 1],
+    "DIMM1": [4, 5],
+    "DIMM2": [6, 7]
+}
+
+
+class RuncommadException(Exception):
+    pass
+
+
+def run_command(cmdline, valid_return_code=(0, )):
+    """execute a command line in a subprocess."""
+    try:
+        from subprocess import Popen, PIPE
+        p = Popen(cmdline, shell=True, stdout=PIPE, stderr=PIPE)
+        stdout, stderr = p.communicate()
+        if p.returncode not in valid_return_code:
+            raise RuncommadException(
+                "Command '%s' returned exit status [%s]: %s" %
+                (cmdline, p.returncode, stderr)
+            )
+        return stdout
+    except ImportError:
+        from commands import getstatusoutput
+        status, output = getstatusoutput(cmdline)
+        if status >> 8 not in valid_return_code:
+            raise RuncommadException(
+                "Command '%s' returned exit status [%s]: %s" %
+                (cmdline, status >> 8, output)
+            )
+        return output
+
+
+def ecc_hex_cnt(pci_hex_conf):
+    '''address the location of error register form pci hex dump
+    cfg and return raw data'''
+    ErrRegAddre = int("104", 16)
+    ErrRegLen = 32
+    pci_hex_conf = pci_hex_conf.split("\n")
+    pci_hex_conf.pop(0)
+    raw_data = []
+    for line in pci_hex_conf:
+        raw_data += line.split(" ")[1:]
+    try:
+        return raw_data[ErrRegAddre: ErrRegAddre+ErrRegLen]
+    except:
+        sys.exit("UnSported CPU")
+
+
+def cal_channel_ecc(hex_cnt, DimmRankMap):
+    '''calculate ecc error of every rank in a channel'''
+    rank_ecc_cnt = []
+    dimm_ecc_cnt = {}
+    ecc_threshold = int(hex_cnt[25]+hex_cnt[24], 16)
+    # print ecc_threshold
+    for i in range(0, 8):
+        '''
+        total 8 rank, every counter is 16bit
+        '''
+        rank_ecc_cnt.append(
+            int(hex_cnt.pop(1)+hex_cnt.pop(0), 16)
+        )
+    for dimm, rank in DimmRankMap.iteritems():
+        dimm_ecc_cnt[dimm] = {}
+        for i in rank:
+            dimm_ecc_cnt[dimm]["RANK"+str(i)] = rank_ecc_cnt[i]
+
+    return dimm_ecc_cnt
+
+
+def memecc(CpuDominMap, Device, ChFuncMap, DimmRankMap):
+    mem_ecc_cnt = {}
+    for k_cpu, v_cpu in CpuDominMap.iteritems():
+        mem_ecc_cnt[k_cpu] = {}
+        for k_ch, v_ch in ChFuncMap.iteritems():
+            cmd = "sudo /sbin/lspci -xxxx -s %s" % v_cpu+":"+Device+"."+v_ch
+            try:
+                pci_hex_conf = run_command(cmd)
+                if len(pci_hex_conf) == 0:
+                    return {}
+            except:
+                return {}
+            raw_data = ecc_hex_cnt(pci_hex_conf)
+            mem_ecc_cnt[k_cpu][k_ch] = copy.deepcopy(
+                cal_channel_ecc(raw_data, DimmRankMap)
+            )
+    return mem_ecc_cnt
+
+
+if __name__ == "__main__":
+
+    ecc_increase_flag = False
+
+    MSG = []
+    mem_ecc_cnt = memecc(CpuDominMap=CpuDominMap,
+                         Device=Device,
+                         ChFuncMap=ChFuncMap,
+                         DimmRankMap=DimmRankMap)
+    try:
+        with open("/dev/shm/memecc.log", "r") as f:
+            ori_mem_ecc_cnt = pickle.load(f)
+    except:
+        ori_mem_ecc_cnt = copy.deepcopy(mem_ecc_cnt)
+    with open("/dev/shm/memecc.log", "w") as f:
+        pickle.dump(mem_ecc_cnt, f)
+
+    for k_cpu in mem_ecc_cnt.keys():
+        for k_ch in mem_ecc_cnt[k_cpu].keys():
+            for k_dimm in mem_ecc_cnt[k_cpu][k_ch].keys():
+                for k_rank in mem_ecc_cnt[k_cpu][k_ch][k_dimm].keys():
+                    inecc = (mem_ecc_cnt[k_cpu][k_ch][k_dimm][k_rank] -
+                             ori_mem_ecc_cnt[k_cpu][k_ch][k_dimm][k_rank])
+                    if inecc != 0:
+                        ecc_increase_flag = True
+                    MSG.append({
+                        "location": str(k_cpu+k_ch+k_dimm+k_rank),
+                        "ecc_cnt": str(
+                            mem_ecc_cnt[k_cpu][k_ch][k_dimm][k_rank]
+                        ),
+                        "ecc_increased": str(inecc)
+                    })
+
+    if not ecc_increase_flag:
+        try:
+            with open("/dev/shm/ecc_increase_from_when", "w") as f:
+                f.write(str(time.time())+"\n")
+            continue_increase = 0
+        except:
+            pass
+        continue_increase = 0
+    else:
+        try:
+            with open("/dev/shm/ecc_increase_from_when", "r") as f:
+                continue_increase = time.time() - float(f.readline().strip())
+        except:
+            with open("/dev/shm/ecc_increase_from_when", "w") as f:
+                f.write(str(time.time())+"\n")
+            continue_increase = 0
+    continue_increase = continue_increase/3600.0
+    MSG = [{'continue_increase': continue_increase}]
+
+    print {
+        "collection_flag": 0,
+        "error_info": "",
+        "MSG": MSG
+    }

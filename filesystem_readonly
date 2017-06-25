@@ -1,0 +1,52 @@
+#!/home/tops/bin/python
+# check readonly filesystem
+
+
+import commands
+try:
+    import json
+except:
+    import simplejson as json
+
+check_mount_points=commands.getoutput("df -hP|grep '^/dev'|awk '{print $NF}'").split('\n')
+readonly_count=0
+msg=[]
+
+def output(o,flag=0,info='None'):
+    dict={"collection_flag":flag,"error_info":info,"MSG":o}
+    print json.dumps(dict)
+
+
+def mountstatus(line):
+    entry = {
+        "device": "",
+        "mountpoint": "",
+        "fstype": "",
+        "options": ""
+    }
+
+    line = line.split()
+    entry['device'] = line[0]
+    entry['mountpoint'] = line[1]
+    entry['fstype'] = line[2]
+    entry['options'] = line[3]
+
+    return entry
+
+
+if __name__ == "__main__":
+
+    try:
+        f = open("/proc/mounts", "r")
+        for line in f.readlines():
+            entry = mountstatus(line)
+            if (entry['mountpoint'] in check_mount_points) \
+                    or entry['device'].startswith("/dev/sda"):
+                if "ro" in entry["options"].split(","):
+                    readonly_count += 1
+                    msg.append(entry["mountpoint"])
+    except:
+        f.close()
+    if readonly_count == 0:msg='ok'
+    dd=[{'status':readonly_count,'msg':msg}]
+    output(dd)

@@ -1,0 +1,61 @@
+#! /bin/bash
+
+# Print alarm json messages
+function print_json()
+{
+    local json=`echo "$1" | sed -r 's/,{2,}/,/g;s/(^,)|(,$)//g;'`
+
+    cat <<EOF
+{
+    "collection_flag":0,
+    "MSG": [$json]
+}
+EOF
+}
+
+old_D_proc_cnt=0
+new_D_proc_cnt=0
+function check_proc_D(){
+    local nowtime=`date +%s`
+    local newstamp=`echo "$nowtime-86400"|bc -l`
+    D_proc_all=`ps -elf|awk '$2~/D/'|awk '{print $4}'`
+    total_D_proc=`echo "$D_proc_all" |wc -l `
+    if [ $total_D_proc -lt 150 ];then
+       for pid in $D_proc_all;do
+       lstart=`ps -p $pid -o lstart|tail -1`
+       lstart_time=`date -d"$lstart" +%s`
+       if [ $lstart_time -lt $newstamp ];then
+          old_D_proc_cnt=`echo "$old_D_proc_cnt+1"|bc -l`
+       else
+          new_D_proc_cnt=`echo "$new_D_proc_cnt+1"|bc -l`
+       fi
+       done
+    else
+       old_D_proc_cnt=$total_D_proc
+    fi
+}
+    
+
+function check_load()
+{
+    local cpu_num=`cat /proc/cpuinfo | grep processor | wc -l`
+    local load_arr=(`uptime | awk -Faverage: '{print $2}' | tr -d ','`)
+    local load1 load5 load15 load1_per_cpu load5_per_cpu load15_per_cpu
+    load1=${load_arr[0]}
+    load5=${load_arr[1]}
+    load15=${load_arr[2]}
+    load1_per_cpu=$(echo $load1 $cpu_num | awk '{print $1/$2}')
+    load5_per_cpu=$(echo $load5 $cpu_num | awk '{print $1/$2}')
+    load15_per_cpu=$(echo $load15 $cpu_num | awk '{print $1/$2}')
+
+    echo "{\"cpu_num\":$cpu_num,\"load1\":$load1,\"load5\":$load5,\"load15\":$load15,\"load1_per_cpu\":$load1_per_cpu,\"load5_per_cpu\":$load5_per_cpu,\"load15_per_cpu\":$load15_per_cpu,\"old_D_proc_cnt\":$old_D_proc_cnt,\"new_D_proc_cnt\":$new_D_proc_cnt}"
+}
+
+function main()
+{
+    check_proc_D 
+    local msg=$(check_load)
+    print_json $msg
+}
+
+main

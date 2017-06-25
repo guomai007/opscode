@@ -1,0 +1,46 @@
+#!/bin/sh
+source /usr/alisys/dragoon/libexec/monitor/include/utils.sh
+
+###query cpu vendor freq and current freq
+cpuinfo=`cat /proc/cpuinfo |grep '^model name'|head -1`
+cpufreq=`echo $cpuinfo|awk '{print $NF}'`
+if echo $cpufreq | grep -i ghz >/dev/null ; then
+   tmpa=`echo $cpufreq |sed 's/[Gg][Hh]z//'`
+   vendor_freq=`echo "$tmpa*1000"|bc -l`
+else
+   msg='unknown vendor default CPU frequency!'
+   state=1
+   exit 1
+fi
+
+
+cur_freq=`cat /proc/cpuinfo |grep 'cpu MHz'|head -1|awk '{print $NF}'`
+tmpb=`echo "$vendor_freq-$cur_freq"|bc -l`
+offset=`printf "%1.f\n" $tmpb`
+
+
+###query system capable of software CPU speed control
+cpuseq=`cat /proc/cpuinfo |grep processor|head -1|awk '{print $NF}'`
+if [ -d /sys/devices/system/cpu/cpu$cpuseq/cpufreq ];then
+   is_exist=true
+else
+   is_exist=false
+fi
+
+###show stats
+if [ $offset -ge 100 ] ;then
+   if $is_exist ; then
+      msg='cpu frequency run in underclock!'
+      state=3
+   else
+      msg='cpu frequency mabye run in underlock!'
+      state=2
+   fi
+else
+   msg='cpu frequency is normal!'
+   state=0
+fi
+
+MSG="{\"state\":$state,
+     \"msg\":\"$msg\"}"
+print_json

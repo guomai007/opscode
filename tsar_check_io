@@ -1,0 +1,8 @@
+#!/bin/bash
+tsar_result="$(tsar --io --check)"
+if [[ $(echo "$tsar_result"|wc -l) != 1 ]];then
+    version="$(rpm -q tsar)"
+    echo "{'collection_flag':500,'error_info':'tsar return more than 1 line. maybe $version is too old'}"
+    exit
+fi
+echo "$tsar_result"|cut -d$'\t'  -f3-|tr -d '\n'|awk 'BEGIN {RS=" ";FS="[:=]";lastdiskname="X";printf "{\"collection_flag\":0,\"error_info\":\"\",\"MSG\":["}{if ( $3 ~ /^-$|^null$/ || $4 ~ /^-$/ ) next;diskarray[$2];rowarray[$3];returnarray[$2,$3]=$4;lastdiskname=$2;}END {for (i in diskarray) {printf "{\"disk\":\""i"\"";for (j in rowarray) {printf ",\""j"\":"returnarray[i SUBSEP j];};printf ",\"iops\":"returnarray[i SUBSEP "rs"]+returnarray[i SUBSEP "ws"];printf "},";};print "]}";}'

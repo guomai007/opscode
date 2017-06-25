@@ -1,0 +1,25 @@
+#!/home/tops/bin/python
+import os
+import commands
+import json
+
+def is_disk_error():
+	if commands.getstatus("dmesg | grep 'task abort: SUCCESS scmd'") == 0:
+		return True
+	return False
+
+sdaUtils = commands.getoutput("iostat -xm 1 10 /dev/sda | grep sda | awk '{print $NF}'").split("\n")
+sdaUtils = sum(map(lambda x:float(x), sdaUtils))/len(sdaUtils)
+load = os.getloadavg()[0]
+if (load > 20) and is_disk_error():
+	disk_error = 1
+else:
+	disk_error = 0
+
+MSG = {"sdaUtils": sdaUtils, "load1": load, "disk_error": disk_error}
+
+print {
+	"collection_flag": 0,
+	"error_info": "",
+	"MSG": [MSG]
+}
