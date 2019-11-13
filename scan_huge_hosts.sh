@@ -22,7 +22,7 @@ while true; do
 done
 
 if [ -s /tmp/ping_ok ];then
-    $PSSH_CMD -t5 -i -O StrictHostKeyChecking=no -l $SSH_USER -h /tmp/ping_ok  "uptime" |grep -e SUCCESS -e FAILURE > /tmp/ssh_result
+    $PSSH_CMD -h /tmp/ping_ok -l $SSH_USER -t5 -O StrictHostKeyChecking=no -O IdentityFile=/root/.ssh/fsp-id_rsa "uptime" |grep -e SUCCESS -e FAILURE > /tmp/ssh_result
 fi
 grep SUCCESS /tmp/ssh_result |awk '{print $NF}' > /tmp/ssh_ok
 grep FAILURE /tmp/ssh_result |while read line ; do
@@ -34,17 +34,14 @@ grep FAILURE /tmp/ssh_result |while read line ; do
     fi
 done
 
-
-echo "ping_Down Host:"
-cat /tmp/ping_fail
-echo ''
 echo "ping_Alive and ssh_Normal Host:"
 cat /tmp/ssh_ok
 echo ''
+echo "ping_Down Host:"
+cat /tmp/ping_fail
+echo ''
 echo "ping_Alive and ssh_Error Host: ## Maybe Reason: 1.Password or PublicKey Error 2.SSHD Return Connection Reset"
 cat /tmp/ssh_error
-#/usr/bin/parallel-ssh -t5 -i -O StrictHostKeyChecking=no -l fsp -h /tmp/ssh_error  "uptime"
 echo ''
 echo "ping_Alive and ssh_Timeout Host: ## Maybe Reason: 1.Host is Busying and Load is High"
 cat /tmp/ssh_timeout
-#/usr/bin/parallel-ssh -t5 -i -O StrictHostKeyChecking=no -l fsp -h /tmp/ssh_timeout  "uptime"
