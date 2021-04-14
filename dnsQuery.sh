@@ -41,7 +41,7 @@ do
     fi
     echo -e "$ZONE\t${DNSSERVER}\t\t${RESULT}"
     done
-done <  ~/bin/cn-ldns
+done <  ./cn-ldns
 echo "---------------------------------------------------------------------------"
 echo "Summary: "
 echo "           Query succeed: "${SUMOK}"     Query failed: "${SUMFAIL}
