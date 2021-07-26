@@ -1,0 +1,156 @@
+#!/bin/bash
+
+######################################################
+#       Type     :
+#       Function :
+#       Usage    :      ./check_nuwa_proxy.sh
+#       Creator  :      yubin.syb    Date : 2015.04.13
+#       Modifier :
+#       ChangeLog:
+######################################################
+
+#profile
+export LANG=en_US.UTF-8
+export PATH="/usr/ali/bin:/usr/ali/sbin:/sbin:/usr/sbin:/bin:/usr/bin:/usr/local/bin:/usr/local/sbin"
+
+self="check_nuwa_proxy"
+switch="/opt/monitor_lock/$self.lock"
+status=0
+msg=""
+json=""
+
+rpc_caller="/apsara/deploy/rpc_caller"
+nuwa_client_ConfigFile="/dev/shm/check_nuwa_proxy.configfile"
+tmp_file_index="/dev/shm/check_nuwa_proxy.tmpfile"
+
+# exec cmd with timeout
+# $1: waittime
+# $2..: cmd
+# 
+# Note:
+# not support |
+
+function shell_timeout()
+{
+    local waittime="$1"
+    shift
+    local cmd="$@"
+
+    $cmd &
+    local pid=$!
+
+    while kill -0 $pid &>/dev/null; do
+        sleep 1
+        let waittime-=1
+        if [ "$waittime" = "0" ]; then
+            kill -9 $pid &>/dev/null
+            wait $pid &>/dev/null
+        fi
+    done
+}
+
+function i_exit()
+{
+    local rt="$1"
+    local is_clean="$2"
+    local msg="${3:-$1}"
+
+cat <<EOF
+    {
+        "collection_flag":$rt,
+        "error_info":"$msg",
+        "MSG":[ { msg: "$msg" } ]
+    }
+EOF
+
+    [[ $is_clean -eq 1 ]] && rm -f "$lockfile" &>/dev/null
+    exit $rt 
+}
+
+function change_status()
+{
+    if [ $status -eq 0 ];then
+        status=$1
+    elif [ $status -eq 1 ] && [ $1 -gt 1 ];then
+        status=$1
+    fi  
+}
+
+function is_in_monitor_list()
+{
+    local cluster_name=`/bin/me|awk '/Local_cluster/{print $NF}'` 
+    local black_monitor_list="AY36A AY37A"
+    echo $black_monitor_list|grep $cluster_name >/dev/null 2>&1
+    ret=$?
+    if [ $ret -eq 0 ];then
+        msg="Does not need check,in black monitor list."
+        return 1
+    fi
+}
+
+
+function write_config_file()
+{
+    local cluster_name=$1
+    local proxy_ip=$2    
+    cat >$nuwa_client_ConfigFile <<EOF
+{
+    "localcluster": "$cluster_name",
+    "proxy": [
+        "$proxy_ip:10245"
+    ],
+    "server": [
+        "127.0.0.1:10240"
+    ]
+}
+EOF
+}
+
+function check_nuwa_proxy()
+{
+     local cluster_name=`/bin/me|awk '/Local_cluster/{print $NF}'` 
+     local nuwa_proxy=`/bin/me|awk '/Local_nuwa/{print $NF}'|tr '|' '\n'`
+     for ip in `echo $nuwa_proxy`;do
+         write_config_file $cluster_name $ip
+         $rpc_caller --Server=nuwa://localcluster/sys/nuwa/nuwa_proxy_checker-$(date +%Y%m%d%H%M%S) \
+                     --Method=bingo --nuwa_client_ConfigFile=$nuwa_client_ConfigFile >$tmp_file_index.$ip 2>&1
+        cat $tmp_file_index.$ip|grep exception|grep "File doesn't exist" >/dev/null 2>&1
+        ret=$?
+        if [ $ret -ne 0 ] ; then
+            msg="$ip failure,$msg"
+            change_status 1
+        fi
+     done
+
+     if [ -z "$msg" ] && [ $status -eq 0 ] ; then
+         msg="check nuwa proxy success."
+     else
+         msg=`echo $msg|sed 's/.$//'`
+     fi
+}
+
+function print_json()
+{
+    local json=$(echo "$1" | sed -r 's/,{2,}/,/g;s/(^,)|(,$)//g;')
+
+    cat <<EOF
+{
+    "collection_flag":0,
+    "MSG": [$json]
+}
+EOF
+}
+
+function main()
+{
+    [ -e "$switch" ] && i_exit 101 1 "lock exist: $switch"
+
+    is_in_monitor_list && check_nuwa_proxy
+
+    json="\"status\":$status"
+    json="\"msg\":\"$msg\", $json"
+
+    print_json "{$json}"
+}
+
+main "$@"

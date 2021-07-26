@@ -43,7 +43,12 @@ CMD_MODPROBE="/sbin/modprobe"
 CMD_FILE="/usr/bin/file"
 CMD_IPMITOOL="/usr/bin/ipmitool"
 CMD_WGET="/usr/bin/wget -T10 -t3 -w3 -c -q -P /tmp"
-CMD_CURL="/usr/bin/curl -m 10 --connect-timeout 5 -4 -s"
+if [ -e /usr/bin/curl ]; then
+    CMD_CURL="/usr/bin/curl -m 10 --connect-timeout 5 -4 -s"
+else
+    curl_dir=`which curl`
+    CMD_CURL="$curl_dir -m 10 --connect-timeout 5 -4 -s"
+fi
 CMD_INSTALL="/usr/bin/install"
 CMD_TEE="/usr/bin/tee"
 CMD_DMIDECODE="/usr/sbin/dmidecode"
@@ -87,7 +92,7 @@ pub_sn=
 # for logging
 pub_log_time=`date`
 pub_start_time=`date +'%Y-%m-%d %H:%M:%S'`
-
+pub_start_time_stamp=`date +%s`
 # common URL, directories and hwinfo integration
 pub_tools_server="http://yum.tbsite.net/aliyun/5Server/x86_64/server/hardware/tool"
 pub_chkhw_logdir="/var/log/check_hw"
@@ -240,10 +245,13 @@ function pub_IdcFreeCreate() {
     else
         ${CMD_CURL} -d "userName=$pri_api&sn=$pub_sn&type=$pri_error_type&errorDisk=$pri_error_disk&remark=$pri_error_log$pri_raw$pri_error_slot" 'http://idc.alibaba-inc.com/repairapi!create.jspa' >/dev/null
         if [ $? -ne 0 ]; then #如果失败就报修到公网API地址
+            sleep 3
             ${CMD_CURL} -d "userName=$pri_api&sn=$pub_sn&type=$pri_error_type&errorDisk=$pri_error_disk&remark=$pri_error_log$pri_raw$pri_error_slot" 'http://42.156.166.86/repairapi!create.jspa' >/dev/null
             if [ $? -ne 0 ]; then
+                sleep 2
                 ${CMD_CURL} -d "userName=$pri_api&sn=$pub_sn&type=$pri_error_type&errorDisk=$pri_error_disk&remark=$pri_error_log$pri_raw$pri_error_slot" 'http://100.67.16.32/repairapi!create.jspa' >/dev/null
                 if [ $? -ne 0 ]; then
+                    sleep 3
                     ${CMD_CURL} -d "userName=$pri_api&sn=$pub_sn&type=$pri_error_type&errorDisk=$pri_error_disk&remark=$pri_error_log$pri_raw$pri_error_slot" 'http://110.75.103.51/repairapi!create.jspa' >/dev/null
                     if [ $? -eq 0 ]; then
                         err_msg="Error - report to IDCFree failed: &type=$pri_error_type&errorDisk=$pri_error_disk&remark=$pri_error_log$pri_raw$pri_error_slot"
@@ -355,8 +363,10 @@ function pub_basetool() {
 function pub_isVirtualHost() {
     # check hwinfo
     hyper_type=`cat /etc/hwinfo/hwinfo.conf 2>/dev/null | grep -oE "system_hypervisor_type[^,]+,"`
+    echo "$hyper_type" | grep -qiE "xen-domu|container|xen-hvm|qemu|vmware|virtualbox|linux_vserver" && pub_vm_exit
+    #echo "$hyper_type" | grep -qwiE "xen|kvm" && pub_vm_exit
     echo "$hyper_type" | grep -qE "xen xen-dom0" && return
-    echo "$hyper_type" | grep -qE "xen-domU|container"     && pub_vm_exit
+    #echo "$hyper_type" | grep -qE "xen-domU|container"     && pub_vm_exit
 
     # 'control_d' if dom0, empty if domU
     if [ -f /proc/xen/capabilities ]; then
@@ -364,7 +374,15 @@ function pub_isVirtualHost() {
     fi
 
     # LXC container check
-    cat /proc/self/cgroup 2>/dev/null | grep -qE "^[0-9]+:.+:/.+$" && pub_vm_exit
+    LXC_flag=""
+    if [ -e /proc/1/environ ]; then
+        ${CMD_SUDO} grep -iqE 'lxc|container=' /proc/1/environ
+        if [ $? -eq 0 ]; then
+            LXC_flag="yes"
+        fi
+    fi
+    #cat /proc/self/cgroup 2>/dev/null | grep -qE "^[0-9]+:.+:/.+$" && pub_vm_exit
+    cat /proc/self/cgroup 2>/dev/null | grep -qE "^[0-9]+:.+:/.+$" && [ -n "$LXC_flag" ] && pub_vm_exit
 
     # script or text file in some guest
     if [ -x ${CMD_FILE} ]; then
@@ -737,12 +755,15 @@ function pub_check_memoryHealth () {
     local pri_dif
     local pri_is_xenServer
 
+    pri_is_xenServer=`cat /sys/hypervisor/type 2>/dev/null`
     # don't check if mem=XXXM in /proc/cmdline
     if grep -q 'mem=' /proc/cmdline; then
-        return
+        if [ -z "$pri_is_xenServer" ]; then
+            return
+        fi
     fi
 
-    pri_is_xenServer=`cat /sys/hypervisor/type 2>/dev/null`
+    #pri_is_xenServer=`cat /sys/hypervisor/type 2>/dev/null`
 
     #检查dmidecode和meminfo或者xm info看到的内存是否一致
     if uname -r | grep -iq ESX; then # ESX-i Server
@@ -805,6 +826,27 @@ function pub_check_memoryHealth () {
             pub_IdcFreeQuery 2 && pub_IdcFreeCreate "unknown" "Memory less than $pri_DmitotalG G [IN DMIDECODE], now $pri_MemtotalG G." "2"
             pub_messageSend "mem" "[ ERROR ]" "Memory less than $pri_DmitotalG G [IN DMIDECODE], now $pri_MemtotalG G."
             return
+        fi
+        if pub_is_ecs_host; then
+            if echo $pub_alitype | grep -qiE 's10-3s|c7'; then
+                pri_diff1=`expr 128 - $pri_DmitotalG`
+                if [ $pri_diff1 -ge $pri_size ]; then
+                    exitstatus=$error
+                    pub_messageAppend "Memory baseline is 128G,now is $pri_DmitotalG G [IN DMIDECODE]."
+                    pub_IdcFreeQuery 2 && pub_IdcFreeCreate "unknown" "Memory baseline is 128G,now is $pri_DmitotalG G [IN DMIDECODE]." "2"
+                    pub_messageSend "mem" "[ ERROR ]" "Memory baseline is 128G,now is $pri_DmitotalG G [IN DMIDECODE]."
+                    return
+                fi
+            elif echo $pub_alitype | grep -qiE 'n32|c8'; then
+                pri_diff1=`expr 256 - $pri_DmitotalG`
+                if [ $pri_diff1 -ge $pri_size ]; then
+                    exitstatus=$error
+                    pub_messageAppend "Memory baseline is 256G,now is $pri_DmitotalG G [IN DMIDECODE]."
+                    pub_IdcFreeQuery 2 && pub_IdcFreeCreate "unknown" "Memory baseline is 256G,now is $pri_DmitotalG G [IN DMIDECODE]." "2"
+                    pub_messageSend "mem" "[ ERROR ]" "Memory baseline is 256G,now is $pri_DmitotalG G [IN DMIDECODE]."
+                    return
+                fi
+            fi
         fi
     done
 }
@@ -1212,6 +1254,43 @@ function pub_checkmegasas() {
                 fi
             fi
         fi
+        #CK_Megaraid_ECC     CK_Megaraid_Reset
+       [ -e /tmp/events.log ] && rm -rf /tmp/events.log
+       local raid_ecc_num=0
+       local raid_reset_num=0
+       local raid_ecc_time=0
+       local raid_reset_time=0
+       local raid_ecc_time_stamp=0
+       local raid_reset_time_stamp=0
+       local raid_ecc_time_cmp=0
+       local raid_reset_time_cmp=0
+       ${CMD_SUDO} ${CMD_MEGACLI} -AdpEventLog -GetEvents -f /tmp/events.log -aALL >/dev/null 2>&1
+       if [[ -e /tmp/events.log ]];then
+           raid_ecc_num=`cat /tmp/events.log|grep "Multi-bit ECC"|wc -l`
+           raid_reset_num=`cat /tmp/events.log|grep -i fatal|grep -i error|grep -i reset|wc -l`
+       fi
+       if [[ $raid_ecc_num -gt 0 ]]; then
+          raid_ecc_time=$(tac /tmp/events.log | sed -n '/Multi-bit ECC/,$p' | grep -m1 Time|awk '{$1="";print $0}') \
+          && raid_ecc_time_stamp=$(date -d "$raid_ecc_time" +%s) && raid_ecc_time_cmp=$(($pub_start_time_stamp-$raid_ecc_time_stamp))
+       #  echo $raid_ecc_time_cmp
+          if [ $raid_ecc_time_cmp -le 1296000 ] && [ $raid_ecc_time_cmp -gt 0 ];then
+              exitstatus=$error
+              pub_messageAppend "ErrorCode:8-01,RAID Cache ECC detected!"
+              pub_IdcFreeCreate  "raid" "ErrorCode:8-01,RAID Cache ECC detected!" "8" #报修
+              pub_messageSend "raid" "[ ERROR ]" "$msg" #发syslog
+          fi
+       fi
+       if [[ $raid_reset_num -gt 0 ]]; then
+          raid_reset_time=$(tac /tmp/events.log | sed -n '/fatal error and was reset/,$p' | grep -m1 Time|awk '{$1="";print $0}') \
+          && raid_reset_time_stamp=$(date -d "$raid_reset_time" +%s) && raid_reset_time_cmp=$(($pub_start_time_stamp-$raid_reset_time_stamp))
+        #  echo $raid_reset_time_cmp
+          if [ $raid_reset_time_cmp -le 1296000 ] && [ $raid_reset_time_cmp -gt 0 ];then
+              exitstatus=$error
+              pub_messageAppend "ErrorCode:8-02,RAID fatal error and reset detected!"
+              pub_IdcFreeCreate  "raid" "ErrorCode:8-02,RAID fatal error and reset detected!" "8" #报修
+              pub_messageSend "raid" "[ ERROR ]" "$msg" #发syslog
+          fi
+       fi
 
         #检查电池状态
         local pri_bbu=`cat $pri_megacli_all |grep -i ^bbu|head -n 1|awk -F: '{print $2}'|sed 's/^[ \t]//g'|sed 's/[ \t]$//g'`
