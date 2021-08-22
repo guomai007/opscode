@@ -24,7 +24,7 @@ do
          continue
     fi
     for DNSSERVER in `echo $LINE`;do
-    RESULT=`dig +short +time=2 +tries=2 @$DNSSERVER $1 |tr -d "\n\r"`
+    RESULT=`dig +short +time=2 +tries=2 @$DNSSERVER $1 |egrep -o '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'|sed ':a;N;s/\n/,/;ta'`
     if [ -n "$RESULT" ]
         then
             SUMOK=`expr $SUMOK \+ 1`
@@ -39,9 +39,9 @@ do
             RESULT='NO Result!'
             SUMFAIL=`expr $SUMFAIL \+ 1`
     fi
-    echo -e "$ZONE\t${DNSSERVER}\t\t${RESULT}"
+    echo -e "$ZONE\t@${DNSSERVER}\t\t${RESULT}"
     done
-done <  ./cn-ldns
+done <  ./dnslist
 echo "---------------------------------------------------------------------------"
 echo "Summary: "
 echo "           Query succeed: "${SUMOK}"     Query failed: "${SUMFAIL}
