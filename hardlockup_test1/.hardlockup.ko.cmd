@@ -1,1 +1,0 @@
-cmd_/root/hardlockup_test1/hardlockup.ko := ld -r -m elf_x86_64 -T ./scripts/module-common.lds --build-id  -o /root/hardlockup_test1/hardlockup.ko /root/hardlockup_test1/hardlockup.o /root/hardlockup_test1/hardlockup.mod.o
