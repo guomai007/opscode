@@ -1,4 +1,4 @@
-#!/home/tops/bin/python
+#!/bin/env python
 # check readonly filesystem
 
 
